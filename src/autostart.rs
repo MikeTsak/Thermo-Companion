@@ -6,6 +6,13 @@ use winreg::RegKey;
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const VALUE_NAME: &str = "ThermoCompanion";
 
+pub fn is_enabled() -> bool {
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    hkcu.open_subkey_with_flags(RUN_KEY, KEY_READ)
+        .and_then(|k| k.get_value::<String, _>(VALUE_NAME))
+        .map_or(false, |v| !v.trim().is_empty())
+}
+
 pub fn set(enabled: bool) -> Result<(), String> {
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
     let key = hkcu

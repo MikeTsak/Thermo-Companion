@@ -137,12 +137,16 @@ pub fn connect(client_id: &str, client_secret: &str, with_mail: bool) -> Result<
                     reply(
                         &mut stream,
                         "200 OK",
-                        "<html><body style=\"font-family:Segoe UI,sans-serif;text-align:center;margin-top:20vh\"><h2>Thermo Companion is connected.</h2><p>You can close this tab.</p></body></html>",
+                        "<html><body style=\"font-family:Segoe UI,sans-serif;text-align:center;margin-top:20vh\"><h2>Thermo Companion is connected.</h2><p>Made by <a href=\"https://miketsak.gr\">miketsak.gr</a> — you can close this tab.</p></body></html>",
                     );
                     break code;
                 }
                 if let Some(err) = query_param(first, "error") {
-                    reply(&mut stream, "200 OK", "<html><body>Sign-in was cancelled. You can close this tab.</body></html>");
+                    reply(
+                        &mut stream,
+                        "200 OK",
+                        "<html><body style=\"font-family:Segoe UI,sans-serif;text-align:center;margin-top:20vh\"><h2>Sign-in was cancelled.</h2><p>Made by <a href=\"https://miketsak.gr\">miketsak.gr</a> — you can close this tab.</p></body></html>",
+                    );
                     return Err(err);
                 }
                 reply(&mut stream, "404 Not Found", "");

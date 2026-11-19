@@ -164,6 +164,9 @@ impl<'a> Slip<'a> {
     /// Feed the paper past the cutter and cut.
     pub fn finish_with(mut self, mood: Mood) -> Vec<u8> {
         self.sticker(mood);
+        self.center();
+        self.put("made by miketsak.gr");
+        self.left();
         self.finish_plain()
     }
 

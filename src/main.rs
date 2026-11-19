@@ -13,6 +13,7 @@ mod pip;
 mod printer;
 mod raster;
 mod sysinfo;
+mod update;
 
 use app::{Notify, Shared};
 use native_windows_gui as nwg;
@@ -91,7 +92,7 @@ fn build(shared: Arc<Shared>) -> Result<Tray, nwg::NwgError> {
     nwg::TrayNotification::builder()
         .parent(&host)
         .icon(Some(&icon))
-        .tip(Some(TITLE))
+        .tip(Some("Thermo Companion — made by miketsak.gr"))
         .build(&mut tray)?;
 
     let mut menu = nwg::Menu::default();
@@ -303,7 +304,10 @@ fn run_tray() {
         if let Some(p) = printer::guess_receipt_printer(&printer::list_printers()) {
             cfg.printer = p;
         }
-        // The installer passes --no-autostart when the user unticked "Start with Windows".
+        // The installer passes --autostart only if the user ticked "Start with Windows".
+        if std::env::args().any(|a| a == "--autostart") || autostart::is_enabled() {
+            cfg.start_with_windows = true;
+        }
         if std::env::args().any(|a| a == "--no-autostart") {
             cfg.start_with_windows = false;
         }

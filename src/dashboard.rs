@@ -6,7 +6,7 @@ use crate::config::{self, Config};
 use crate::data::{self, Data, Note, NoteItem};
 use crate::escpos::{self, TextOpts};
 use crate::pip::{self, Mood};
-use crate::{autostart, gcal, ical, printer, raster, sysinfo};
+use crate::{autostart, gcal, ical, printer, raster, sysinfo, update};
 use chrono::{Datelike, Local, TimeZone, Timelike};
 use eframe::egui::{self, Color32, CornerRadius, FontFamily, FontId, Margin, RichText, Stroke, TextStyle, Ui};
 use std::sync::atomic::Ordering;
@@ -119,6 +119,7 @@ enum Cmd {
     Planner,
     Countdowns,
     ConnectCalendar,
+    CheckUpdates,
 }
 
 fn all_commands() -> Vec<(String, Cmd)> {
@@ -136,6 +137,7 @@ fn all_commands() -> Vec<(String, Cmd)> {
     v.push(("print a joke".into(), Cmd::Joke));
     v.push(("flip a coin".into(), Cmd::Coin));
     v.push(("connect calendar (google link)".into(), Cmd::ConnectCalendar));
+    v.push(("check for updates".into(), Cmd::CheckUpdates));
     for p in Page::ALL {
         v.push((format!("go to {}", p.name()), Cmd::Go(p, 0)));
         for (i, t) in p.tabs().iter().enumerate() {
@@ -457,6 +459,14 @@ struct Dash {
     cd_date: [i32; 3],
     new_url: String,
     new_proc: String,
+
+    // updates
+    upd_busy: bool,
+    upd_installing: bool,
+    upd_state: Option<Result<update::CheckOutcome, String>>,
+    upd_err: String,
+    upd_check_slot: Arc<Mutex<Option<Result<update::CheckOutcome, String>>>>,
+    upd_apply_slot: Arc<Mutex<Option<Result<(), String>>>>,
 }
 
 const STICKERS: [(&str, Mood); 5] = [
@@ -587,6 +597,12 @@ impl Dash {
             cd_date: [today.year(), today.month() as i32, today.day() as i32],
             new_url: String::new(),
             new_proc: String::new(),
+            upd_busy: false,
+            upd_installing: false,
+            upd_state: None,
+            upd_err: String::new(),
+            upd_check_slot: Arc::new(Mutex::new(None)),
+            upd_apply_slot: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -710,6 +726,33 @@ impl Dash {
             }
         }
 
+        // finished GitHub update check
+        let upd_check = self.upd_check_slot.lock().unwrap().take();
+        if let Some(r) = upd_check {
+            self.upd_busy = false;
+            match &r {
+                Ok(update::CheckOutcome::UpToDate { message, .. }) => self.say(message.clone()),
+                Ok(update::CheckOutcome::Available(rel)) => {
+                    self.say(format!("Update {} is available on GitHub.", rel.tag));
+                }
+                Err(e) => self.say(format!("Update check failed: {e}")),
+            }
+            self.upd_state = Some(r);
+        }
+
+        // finished downloading update; exit so the updater script can swap the exe and restart Pip
+        let upd_apply = self.upd_apply_slot.lock().unwrap().take();
+        if let Some(r) = upd_apply {
+            self.upd_installing = false;
+            match r {
+                Ok(()) => std::process::exit(0),
+                Err(e) => {
+                    self.upd_err = e.clone();
+                    self.say(format!("Update failed: {e}"));
+                }
+            }
+        }
+
         // files dropped on the window: pictures to print, Google's client .json
         let dropped = ctx.input(|i| i.raw.dropped_files.clone());
         for f in dropped {
@@ -790,7 +833,43 @@ impl Dash {
             Cmd::Planner => self.job("Printed the week planner", |s| s.print_planner(0)),
             Cmd::Countdowns => self.job("Printed your countdowns", |s| s.print_countdowns()),
             Cmd::ConnectCalendar => self.connect_open = true,
+            Cmd::CheckUpdates => {
+                self.goto(Page::Settings, 3);
+                self.start_update_check();
+            }
         }
+    }
+
+    fn start_update_check(&mut self) {
+        if self.upd_busy || self.upd_installing {
+            return;
+        }
+        self.upd_busy = true;
+        self.upd_err.clear();
+        self.say("Checking GitHub for updates...");
+        let slot = self.upd_check_slot.clone();
+        let notify = self.notify.clone();
+        std::thread::spawn(move || {
+            let res = update::check_latest();
+            *slot.lock().unwrap() = Some(res);
+            notify();
+        });
+    }
+
+    fn start_update_install(&mut self, rel: update::Release) {
+        if self.upd_busy || self.upd_installing {
+            return;
+        }
+        self.upd_installing = true;
+        self.upd_err.clear();
+        self.say(format!("Downloading {}...", rel.tag));
+        let slot = self.upd_apply_slot.clone();
+        let notify = self.notify.clone();
+        std::thread::spawn(move || {
+            let res = update::download_and_apply(&rel);
+            *slot.lock().unwrap() = Some(res);
+            notify();
+        });
     }
 
     fn toggle_focus(&mut self) {
@@ -865,6 +944,8 @@ impl Dash {
         });
         ui.label(mono("ctrl+alt+p", DIM));
         ui.label(mono("= print selection", DIM));
+        ui.add_space(6.0);
+        ui.hyperlink_to(mono("made by miketsak.gr", CYAN), "https://miketsak.gr");
     }
 
     fn status_bar(&self, ui: &mut Ui) {
@@ -872,6 +953,9 @@ impl Dash {
         ui.horizontal_centered(|ui| {
             ui.label(mono("pip@desk:~$", GREEN));
             ui.label(mono(&self.status, if fresh { TEXT } else { DIM }));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.hyperlink_to(mono("made by miketsak.gr", DIM), "https://miketsak.gr");
+            });
         });
     }
 
@@ -1191,6 +1275,7 @@ impl Dash {
                         if self.cfg.track_usage {
                             pill(ui, "tracking: local", PINK);
                         }
+                        ui.hyperlink_to(mono("made by miketsak.gr", CYAN), "https://miketsak.gr");
                     });
                 });
             });
@@ -2375,22 +2460,38 @@ impl Dash {
         match tab {
             0 => self.set_printer(ui),
             1 => section(ui, "02", "system", |ui| {
-                toggle(ui, &mut self.cfg.start_with_windows, "start Thermo Companion with Windows");
+                ui.horizontal(|ui| {
+                    toggle(ui, &mut self.cfg.start_with_windows, "start Thermo Companion with Windows");
+                    pill(
+                        ui,
+                        if self.cfg.start_with_windows { "enabled" } else { "off" },
+                        if self.cfg.start_with_windows { GREEN } else { DIM },
+                    );
+                });
+                ui.label(mono("optional: runs Pip quietly in your tray when you sign in to Windows", DIM));
+                ui.add_space(4.0);
                 toggle(ui, &mut self.cfg.hotkey, "Ctrl+Alt+P prints the selected text from any app");
                 toggle(ui, &mut self.cfg.setup_dismissed, "hide the getting-started list on Home");
             }),
             2 => self.set_calendar(ui),
-            _ => section(ui, "04", "about", |ui| {
-                ui.horizontal(|ui| {
-                    ui.add(egui::Image::from_texture(self.tex.get(Mood::Happy)).fit_to_exact_size(egui::vec2(72.0, 72.0)));
-                    ui.vertical(|ui| {
-                        ui.label(RichText::new(format!("Thermo Companion v{}", env!("CARGO_PKG_VERSION"))).strong());
-                        ui.label(mono("pip says hi. made with rust. mit license.", DIM));
-                        ui.label(mono(&format!("settings: {}", config::dir().display()), DIM));
-                        ui.label(mono("shortcuts: ctrl+k search, ctrl+1..7 pages, ctrl+alt+p print selection", DIM));
+            _ => {
+                section(ui, "04", "about", |ui| {
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Image::from_texture(self.tex.get(Mood::Happy)).fit_to_exact_size(egui::vec2(72.0, 72.0)));
+                        ui.vertical(|ui| {
+                            ui.label(RichText::new(format!("Thermo Companion v{}", env!("CARGO_PKG_VERSION"))).strong());
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(mono("pip says hi. made by", DIM));
+                                ui.hyperlink_to(mono("miketsak.gr", CYAN), "https://miketsak.gr");
+                                ui.label(mono("with rust. mit license.", DIM));
+                            });
+                            ui.label(mono(&format!("settings: {}", config::dir().display()), DIM));
+                            ui.label(mono("shortcuts: ctrl+k search, ctrl+1..7 pages, ctrl+alt+p print selection", DIM));
+                        });
                     });
                 });
-            }),
+                self.set_updates(ui);
+            }
         }
     }
 
@@ -2462,6 +2563,110 @@ impl Dash {
                     self.connect_tab = 1;
                 }
             });
+        });
+    }
+
+    fn set_updates(&mut self, ui: &mut Ui) {
+        section(ui, "05", "updates", |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(mono(&format!("installed: v{}  | ", env!("CARGO_PKG_VERSION")), DIM));
+                ui.hyperlink_to(mono("made by miketsak.gr", CYAN), "https://miketsak.gr");
+                ui.label(mono(&format!(" |  github: {}", update::REPO), DIM));
+            });
+
+            let busy = self.upd_busy || self.upd_installing;
+            let btn_label = if self.upd_busy {
+                "checking github..."
+            } else if self.upd_installing {
+                "downloading update..."
+            } else {
+                "check for updates"
+            };
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(
+                        !busy,
+                        egui::Button::new(RichText::new(btn_label).monospace().color(INK).strong())
+                            .fill(AMBER)
+                            .corner_radius(CornerRadius::same(8)),
+                    )
+                    .clicked()
+                {
+                    self.start_update_check();
+                }
+                if ghost(ui, "releases page").clicked() {
+                    ui.ctx().open_url(egui::OpenUrl::new_tab(update::RELEASES_URL));
+                }
+            });
+
+            let mut install_rel: Option<update::Release> = None;
+            let mut open_url: Option<String> = None;
+            match &self.upd_state {
+                Some(Ok(update::CheckOutcome::UpToDate { latest, message })) => {
+                    ui.horizontal_wrapped(|ui| {
+                        pill(ui, "up to date", GREEN);
+                        if let Some(tag) = latest {
+                            ui.label(mono(&format!("latest: {tag}"), DIM));
+                        }
+                    });
+                    ui.label(message);
+                }
+                Some(Ok(update::CheckOutcome::Available(rel))) => {
+                    ui.horizontal_wrapped(|ui| {
+                        pill(ui, &format!("new: {}", rel.tag), AMBER);
+                        ui.label(RichText::new(&rel.title).strong());
+                    });
+                    if !rel.notes.is_empty() {
+                        let preview: String = rel.notes.lines().take(6).collect::<Vec<_>>().join("\n");
+                        egui::Frame::new()
+                            .fill(Color32::from_rgb(7, 10, 15))
+                            .corner_radius(CornerRadius::same(8))
+                            .inner_margin(Margin::same(10))
+                            .show(ui, |ui| {
+                                ui.label(mono(&preview, TEXT));
+                            });
+                    }
+                    ui.horizontal(|ui| {
+                        let has_asset = rel.setup_asset.is_some() || rel.exe_asset.is_some();
+                        if has_asset
+                            && ui
+                                .add_enabled(
+                                    !busy,
+                                    egui::Button::new(
+                                        RichText::new(format!("update to {} & restart", rel.tag))
+                                            .monospace()
+                                            .color(INK)
+                                            .strong(),
+                                    )
+                                    .fill(GREEN)
+                                    .corner_radius(CornerRadius::same(8)),
+                                )
+                                .clicked()
+                        {
+                            install_rel = Some(rel.clone());
+                        }
+                        if ghost(ui, "view release notes").clicked() {
+                            open_url = Some(rel.html_url.clone());
+                        }
+                    });
+                }
+                Some(Err(e)) => {
+                    ui.horizontal(|ui| {
+                        pill(ui, "error", RED);
+                        ui.label(RichText::new(e).color(RED));
+                    });
+                }
+                None => {}
+            }
+            if !self.upd_err.is_empty() {
+                ui.label(RichText::new(&self.upd_err).color(RED));
+            }
+            if let Some(url) = open_url {
+                ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+            }
+            if let Some(rel) = install_rel {
+                self.start_update_install(rel);
+            }
         });
     }
 }

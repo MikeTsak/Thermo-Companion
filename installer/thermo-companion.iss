@@ -10,7 +10,10 @@
 AppId={{B4E0A6C1-3D52-4F8B-9A17-6C2E5D8F0A39}
 AppName=Thermo Companion
 AppVersion={#AppVersion}
-AppPublisher=Thermo Companion
+AppPublisher=miketsak.gr
+AppPublisherURL=https://miketsak.gr
+AppSupportURL=https://github.com/MikeTsak/Thermo-Companion
+AppUpdatesURL=https://github.com/MikeTsak/Thermo-Companion/releases
 DefaultDirName={autopf}\Thermo Companion
 DefaultGroupName=Thermo Companion
 DisableProgramGroupPage=yes
@@ -32,7 +35,7 @@ AppMutex=ThermoCompanionSingleton,ThermoCompanionDashboard
 LicenseFile=..\LICENSE
 
 [Tasks]
-Name: "startup"; Description: "Start Thermo Companion when Windows starts"; GroupDescription: "Options:"
+Name: "startup"; Description: "Start Thermo Companion when Windows starts"; GroupDescription: "Options:"; Flags: unchecked
 Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Options:"; Flags: unchecked
 
 [Files]
@@ -49,8 +52,8 @@ Name: "{autodesktop}\Thermo Companion"; Filename: "{app}\{#AppExe}"; IconFilenam
 Root: HKA; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "ThermoCompanion"; ValueData: """{app}\{#AppExe}"""; Flags: uninsdeletevalue; Tasks: startup
 
 [Run]
-Filename: "{app}\{#AppExe}"; Description: "Start Pip now"; Flags: nowait postinstall skipifsilent; Tasks: startup
-Filename: "{app}\{#AppExe}"; Parameters: "--no-autostart"; Description: "Start Pip now"; Flags: nowait postinstall skipifsilent; Tasks: not startup
+Filename: "{app}\{#AppExe}"; Parameters: "--autostart"; Description: "Start Pip now"; Flags: nowait postinstall skipifsilent; Tasks: startup
+Filename: "{app}\{#AppExe}"; Description: "Start Pip now"; Flags: nowait postinstall skipifsilent; Tasks: not startup
 
 [UninstallRun]
 Filename: "{sys}\taskkill.exe"; Parameters: "/im {#AppExe} /f"; Flags: runhidden; RunOnceId: "StopThermoCompanion"

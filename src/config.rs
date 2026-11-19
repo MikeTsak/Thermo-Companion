@@ -86,7 +86,7 @@ impl Default for Config {
             greeklish: true,
             codepage: None,
             pip_stickers: true,
-            start_with_windows: true,
+            start_with_windows: false,
             hotkey: true,
 
             auto_agenda: true,
