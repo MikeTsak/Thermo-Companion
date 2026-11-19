@@ -2681,6 +2681,26 @@ impl Dash {
                 });
                 ui.label(mono("right-click any image or text file in Explorer (Show more options on Win 11) -> Thermo Print", DIM));
                 ui.add_space(4.0);
+                ui.horizontal_wrapped(|ui| {
+                    if ghost(ui, "open chrome extension folder").clicked() {
+                        let next_to_exe = std::env::current_exe()
+                            .ok()
+                            .and_then(|p| p.parent().map(|d| d.join("extension")))
+                            .filter(|p| p.exists());
+                        let dev_dir = std::path::PathBuf::from("extension");
+                        if let Some(dir) = next_to_exe.or_else(|| dev_dir.exists().then_some(dev_dir)) {
+                            let _ = std::process::Command::new("explorer.exe").arg(dir).spawn();
+                        } else {
+                            self.say("Couldn't find the extension folder.");
+                        }
+                    }
+                    if ghost(ui, "copy chrome://extensions").clicked() {
+                        ui.ctx().copy_text("chrome://extensions".into());
+                        self.say("Copied chrome://extensions — paste it in Chrome's address bar.");
+                    }
+                });
+                ui.label(mono("Chrome: chrome://extensions -> Developer mode -> Load unpacked -> pick extension\\", DIM));
+                ui.add_space(4.0);
                 let hk_label = self.cfg.hotkey_label();
                 toggle(ui, &mut self.cfg.hotkey, &format!("{hk_label} prints the selected text from any app"));
                 ui.horizontal_wrapped(|ui| {

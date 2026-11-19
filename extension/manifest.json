@@ -1,0 +1,26 @@
+{
+  "manifest_version": 3,
+  "name": "Thermo Print — Thermo Companion",
+  "version": "0.2.3",
+  "description": "Right-click selected text, images, links, or pages in Chrome to print them on your thermal printer (made by miketsak.gr).",
+  "permissions": [
+    "contextMenus",
+    "activeTab",
+    "scripting",
+    "notifications"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1:47315/*"
+  ],
+  "icons": {
+    "128": "icon.png"
+  },
+  "action": {
+    "default_icon": "icon.png",
+    "default_popup": "popup.html",
+    "default_title": "Thermo Print"
+  },
+  "background": {
+    "service_worker": "background.js"
+  }
+}

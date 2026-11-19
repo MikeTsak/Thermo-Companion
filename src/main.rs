@@ -2,6 +2,7 @@
 
 mod app;
 mod autostart;
+mod bridge;
 mod config;
 mod dashboard;
 mod data;
@@ -357,6 +358,11 @@ fn run_tray() {
         let sh = shared.clone();
         let notify = tray.notify_fn();
         std::thread::spawn(move || app::scheduler(sh, notify));
+    }
+    {
+        let sh = shared.clone();
+        let notify = tray.notify_fn();
+        std::thread::spawn(move || bridge::serve(sh, notify));
     }
 
     if first_run {

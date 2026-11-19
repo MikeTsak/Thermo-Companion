@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Thermo Print</title>
+  <style>
+    body {
+      margin: 0;
+      padding: 14px;
+      width: 260px;
+      background: #0a0e15;
+      color: #dee6f2;
+      font: 13px/1.45 "Segoe UI", system-ui, sans-serif;
+    }
+    .head {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 10px;
+    }
+    .head img {
+      width: 32px;
+      height: 32px;
+      border-radius: 6px;
+    }
+    .title {
+      font-weight: 700;
+      color: #ffb84d;
+      font-size: 14px;
+    }
+    .status {
+      font-family: ui-monospace, Consolas, monospace;
+      font-size: 12px;
+      padding: 6px 8px;
+      border-radius: 6px;
+      background: #141c29;
+      border: 1px solid #26344a;
+      margin-bottom: 10px;
+    }
+    .ok { color: #78e68c; }
+    .err { color: #ff6e6e; }
+    button {
+      width: 100%;
+      padding: 8px 10px;
+      border: 0;
+      border-radius: 8px;
+      background: #ffb84d;
+      color: #0e121a;
+      font-weight: 700;
+      font-family: ui-monospace, Consolas, monospace;
+      cursor: pointer;
+    }
+    button:disabled { opacity: 0.5; cursor: default; }
+    .tip {
+      margin-top: 10px;
+      color: #8292aa;
+      font-size: 11.5px;
+    }
+    .foot {
+      margin-top: 10px;
+      padding-top: 8px;
+      border-top: 1px solid #26344a;
+      font-size: 11px;
+      color: #8292aa;
+    }
+    a { color: #5ce1e6; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+  </style>
+</head>
+<body>
+  <div class="head">
+    <img src="icon.png" alt="Pip">
+    <div>
+      <div class="title">Thermo Print</div>
+      <div style="font-size:11px;color:#8292aa;">Chrome bridge for Pip</div>
+    </div>
+  </div>
+  <div id="status" class="status">checking Pip...</div>
+  <button id="qr-btn">print current page QR</button>
+  <div class="tip">Tip: highlight text, an image, or a link on any page, then right-click &rarr; <b>Thermo Print</b>.</div>
+  <div class="foot">
+    <a href="https://miketsak.gr" target="_blank" rel="noreferrer">made by miketsak.gr</a>
+  </div>
+  <script src="popup.js"></script>
+</body>
+</html>
