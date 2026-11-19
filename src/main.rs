@@ -22,7 +22,7 @@ use std::cell::Cell;
 use std::ptr::null_mut;
 use std::rc::Rc;
 use std::sync::Arc;
-use winapi::um::winuser::{RegisterHotKey, UnregisterHotKey, MOD_CONTROL, MOD_NOREPEAT, VK_END, WM_HOTKEY};
+use winapi::um::winuser::{RegisterHotKey, UnregisterHotKey, WM_HOTKEY};
 
 pub const TITLE: &str = "Thermo Companion";
 const HOTKEY_ID: i32 = 0x7C01;
@@ -75,7 +75,7 @@ struct Tray {
     mi_quit: nwg::MenuItem,
     _seps: Vec<nwg::MenuSeparator>,
     _icon: nwg::Icon,
-    hotkey_on: Cell<bool>,
+    hotkey_reg: Cell<Option<(u32, u32)>>,
 }
 
 fn build(shared: Arc<Shared>) -> Result<Tray, nwg::NwgError> {
@@ -123,7 +123,8 @@ fn build(shared: Arc<Shared>) -> Result<Tray, nwg::NwgError> {
     let t_agenda = item("Agenda every morning")?;
     let t_briefing = item("Morning briefing")?;
     let t_stubs = item("Stub before events")?;
-    let t_hotkey = item("Hotkey Ctrl+End prints selection")?;
+    let hotkey_text = format!("Hotkey {} prints selection", shared.cfg().hotkey_label());
+    let t_hotkey = item(&hotkey_text)?;
     let t_startup = item("Start with Windows")?;
     let sep3 = sep()?;
     let mi_quit = item("Quit")?;
@@ -151,7 +152,7 @@ fn build(shared: Arc<Shared>) -> Result<Tray, nwg::NwgError> {
         mi_quit,
         _seps: vec![sep1, sep2, sep3],
         _icon: icon,
-        hotkey_on: Cell::new(false),
+        hotkey_reg: Cell::new(None),
     })
 }
 
@@ -174,23 +175,33 @@ impl Tray {
         self.t_startup.set_checked(c.start_with_windows);
     }
 
-    /// Register or release Ctrl+End to match the setting.
+    /// Register or release the print-selection hotkey to match settings.
     fn apply_hotkey(&self) {
-        let want = self.shared.cfg().hotkey;
-        if want == self.hotkey_on.get() {
+        let c = self.shared.cfg();
+        let desired = if c.hotkey {
+            let vk = if c.hotkey_vk == 0 { b'P' as u32 } else { c.hotkey_vk };
+            Some((c.hotkey_win_mods(), vk))
+        } else {
+            None
+        };
+        if desired == self.hotkey_reg.get() {
             return;
         }
         if let Some(hwnd) = self.host.handle.hwnd() {
             unsafe {
-                if want {
-                    let ok = RegisterHotKey(hwnd as _, HOTKEY_ID, (MOD_CONTROL | MOD_NOREPEAT) as u32, VK_END as u32);
-                    self.hotkey_on.set(ok != 0);
-                    if ok == 0 {
-                        config::log("Ctrl+End is already taken by another program");
-                    }
-                } else {
+                if self.hotkey_reg.get().is_some() {
                     UnregisterHotKey(hwnd as _, HOTKEY_ID);
-                    self.hotkey_on.set(false);
+                    self.hotkey_reg.set(None);
+                }
+                if let Some((mods, vk)) = desired {
+                    let ok = RegisterHotKey(hwnd as _, HOTKEY_ID, mods, vk);
+                    if ok != 0 {
+                        self.hotkey_reg.set(Some((mods, vk)));
+                    } else {
+                        let msg = format!("{} is already taken by another program", c.hotkey_label());
+                        config::log(&msg);
+                        self.say(&msg);
+                    }
                 }
             }
         }
@@ -325,7 +336,7 @@ fn run_tray() {
     let t = tray.clone();
     let _handler = nwg::full_bind_event_handler(&tray.host.handle, move |e, _d, h| on_event(&t, e, h));
 
-    // Ctrl+End: print what is selected.
+    // Global hotkey: print what is selected.
     let t = tray.clone();
     let _raw = nwg::bind_raw_event_handler(&tray.host.handle, 0x10000, move |_hwnd, msg, w, _l| {
         if msg == WM_HOTKEY && w as i32 == HOTKEY_ID {

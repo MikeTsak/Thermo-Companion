@@ -21,6 +21,10 @@ pub struct Config {
     pub pip_stickers: bool,
     pub start_with_windows: bool,
     pub hotkey: bool,
+    /// Hotkey modifiers bitmask (1=Ctrl, 2=Alt, 4=Shift, 8=Win).
+    pub hotkey_mods: u32,
+    /// Windows virtual-key code for the print-selection hotkey (default 'P' = 0x50).
+    pub hotkey_vk: u32,
 
     // agenda + briefing
     pub auto_agenda: bool,
@@ -88,6 +92,8 @@ impl Default for Config {
             pip_stickers: true,
             start_with_windows: false,
             hotkey: true,
+            hotkey_mods: HOTKEY_MOD_CTRL | HOTKEY_MOD_ALT,
+            hotkey_vk: b'P' as u32,
 
             auto_agenda: true,
             agenda_hour: 8,
@@ -139,10 +145,91 @@ impl Default for Config {
     }
 }
 
+pub const HOTKEY_MOD_CTRL: u32 = 1;
+pub const HOTKEY_MOD_ALT: u32 = 2;
+pub const HOTKEY_MOD_SHIFT: u32 = 4;
+pub const HOTKEY_MOD_WIN: u32 = 8;
+
+pub fn is_function_vk(vk: u32) -> bool {
+    (0x70..=0x87).contains(&vk) || matches!(vk, 0x2D | 0x2C | 0x13)
+}
+
+pub fn vk_label(vk: u32) -> String {
+    match vk {
+        0x30..=0x39 | 0x41..=0x5A => char::from_u32(vk).unwrap_or('?').to_string(),
+        0x70..=0x87 => format!("F{}", vk - 0x70 + 1),
+        0x20 => "Space".into(),
+        0x09 => "Tab".into(),
+        0x0D => "Enter".into(),
+        0x08 => "Backspace".into(),
+        0x2D => "Insert".into(),
+        0x2E => "Delete".into(),
+        0x24 => "Home".into(),
+        0x23 => "End".into(),
+        0x21 => "PgUp".into(),
+        0x22 => "PgDn".into(),
+        0x25 => "Left".into(),
+        0x26 => "Up".into(),
+        0x27 => "Right".into(),
+        0x28 => "Down".into(),
+        0xBD => "-".into(),
+        0xBB => "=".into(),
+        0xDB => "[".into(),
+        0xDD => "]".into(),
+        0xDC => "\\".into(),
+        0xBA => ";".into(),
+        0xDE => "'".into(),
+        0xBC => ",".into(),
+        0xBE => ".".into(),
+        0xBF => "/".into(),
+        0xC0 => "`".into(),
+        0x2C => "PrtSc".into(),
+        0x13 => "Pause".into(),
+        other => format!("Key(0x{other:02X})"),
+    }
+}
+
 impl Config {
     /// True when events can be read (iCal link or Google sign-in).
     pub fn calendar_linked(&self) -> bool {
         !self.ical_url.trim().is_empty() || !self.google_refresh_token.is_empty()
+    }
+
+    pub fn hotkey_label(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if self.hotkey_mods & HOTKEY_MOD_CTRL != 0 {
+            parts.push("Ctrl".into());
+        }
+        if self.hotkey_mods & HOTKEY_MOD_ALT != 0 {
+            parts.push("Alt".into());
+        }
+        if self.hotkey_mods & HOTKEY_MOD_SHIFT != 0 {
+            parts.push("Shift".into());
+        }
+        if self.hotkey_mods & HOTKEY_MOD_WIN != 0 {
+            parts.push("Win".into());
+        }
+        let vk = if self.hotkey_vk == 0 { b'P' as u32 } else { self.hotkey_vk };
+        parts.push(vk_label(vk));
+        parts.join("+")
+    }
+
+    pub fn hotkey_win_mods(&self) -> u32 {
+        use winapi::um::winuser::{MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, MOD_WIN};
+        let mut m = MOD_NOREPEAT as u32;
+        if self.hotkey_mods & HOTKEY_MOD_CTRL != 0 {
+            m |= MOD_CONTROL as u32;
+        }
+        if self.hotkey_mods & HOTKEY_MOD_ALT != 0 {
+            m |= MOD_ALT as u32;
+        }
+        if self.hotkey_mods & HOTKEY_MOD_SHIFT != 0 {
+            m |= MOD_SHIFT as u32;
+        }
+        if self.hotkey_mods & HOTKEY_MOD_WIN != 0 {
+            m |= MOD_WIN as u32;
+        }
+        m
     }
 }
 
@@ -197,4 +284,20 @@ pub fn log_tail(n: usize) -> Vec<String> {
     let text = fs::read_to_string(dir().join("log.txt")).unwrap_or_default();
     let lines: Vec<&str> = text.lines().collect();
     lines[lines.len().saturating_sub(n)..].iter().map(|s| s.to_string()).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hotkey_label_and_defaults() {
+        let mut c = Config::default();
+        assert_eq!(c.hotkey_label(), "Ctrl+Alt+P");
+        c.hotkey_mods = HOTKEY_MOD_CTRL | HOTKEY_MOD_SHIFT;
+        c.hotkey_vk = 0x78; // F9
+        assert_eq!(c.hotkey_label(), "Ctrl+Shift+F9");
+        assert!(is_function_vk(0x78));
+        assert!(!is_function_vk(b'P' as u32));
+    }
 }

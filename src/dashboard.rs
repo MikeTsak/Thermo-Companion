@@ -357,6 +357,32 @@ fn open_url(url: &str) {
     let _ = std::process::Command::new("rundll32").args(["url.dll,FileProtocolHandler", url]).spawn();
 }
 
+fn egui_key_to_vk(key: egui::Key) -> Option<u32> {
+    use egui::Key::*;
+    let vk = match key {
+        A => b'A' as u32, B => b'B' as u32, C => b'C' as u32, D => b'D' as u32, E => b'E' as u32,
+        F => b'F' as u32, G => b'G' as u32, H => b'H' as u32, I => b'I' as u32, J => b'J' as u32,
+        K => b'K' as u32, L => b'L' as u32, M => b'M' as u32, N => b'N' as u32, O => b'O' as u32,
+        P => b'P' as u32, Q => b'Q' as u32, R => b'R' as u32, S => b'S' as u32, T => b'T' as u32,
+        U => b'U' as u32, V => b'V' as u32, W => b'W' as u32, X => b'X' as u32, Y => b'Y' as u32,
+        Z => b'Z' as u32,
+        Num0 => b'0' as u32, Num1 => b'1' as u32, Num2 => b'2' as u32, Num3 => b'3' as u32, Num4 => b'4' as u32,
+        Num5 => b'5' as u32, Num6 => b'6' as u32, Num7 => b'7' as u32, Num8 => b'8' as u32, Num9 => b'9' as u32,
+        F1 => 0x70, F2 => 0x71, F3 => 0x72, F4 => 0x73, F5 => 0x74, F6 => 0x75,
+        F7 => 0x76, F8 => 0x77, F9 => 0x78, F10 => 0x79, F11 => 0x7A, F12 => 0x7B,
+        F13 => 0x7C, F14 => 0x7D, F15 => 0x7E, F16 => 0x7F, F17 => 0x80, F18 => 0x81,
+        F19 => 0x82, F20 => 0x83, F21 => 0x84, F22 => 0x85, F23 => 0x86, F24 => 0x87,
+        Space => 0x20, Tab => 0x09, Enter => 0x0D, Backspace => 0x08,
+        Insert => 0x2D, Delete => 0x2E, Home => 0x24, End => 0x23, PageUp => 0x21, PageDown => 0x22,
+        ArrowLeft => 0x25, ArrowUp => 0x26, ArrowRight => 0x27, ArrowDown => 0x28,
+        Minus => 0xBD, Equals | Plus => 0xBB, OpenBracket => 0xDB, CloseBracket => 0xDD,
+        Backslash => 0xDC, Semicolon => 0xBA, Quote => 0xDE, Comma => 0xBC,
+        Period => 0xBE, Slash => 0xBF, Backtick => 0xC0,
+        _ => return None,
+    };
+    Some(vk)
+}
+
 /// client_id and client_secret from Google's downloaded JSON (or a path to that file).
 fn parse_client(text: &str) -> Option<(String, String)> {
     let text = text.trim().trim_matches('"');
@@ -467,6 +493,10 @@ struct Dash {
     upd_err: String,
     upd_check_slot: Arc<Mutex<Option<Result<update::CheckOutcome, String>>>>,
     upd_apply_slot: Arc<Mutex<Option<Result<(), String>>>>,
+
+    // hotkey recorder
+    hotkey_listen: bool,
+    hotkey_note: String,
 }
 
 const STICKERS: [(&str, Mood); 5] = [
@@ -603,6 +633,8 @@ impl Dash {
             upd_err: String::new(),
             upd_check_slot: Arc::new(Mutex::new(None)),
             upd_apply_slot: Arc::new(Mutex::new(None)),
+            hotkey_listen: false,
+            hotkey_note: String::new(),
         }
     }
 
@@ -776,7 +808,58 @@ impl Dash {
             }
         }
 
-        // keyboard: command palette and page shortcuts
+        // keyboard: hotkey recorder, or command palette and page shortcuts
+        if self.hotkey_listen {
+            let captured = ctx.input(|i| {
+                for ev in &i.events {
+                    if let egui::Event::Key { key, pressed: true, modifiers, .. } = ev {
+                        if *key == egui::Key::Escape && !modifiers.ctrl && !modifiers.alt && !modifiers.shift {
+                            return Some(Err(()));
+                        }
+                        if let Some(vk) = egui_key_to_vk(*key) {
+                            let mut mods = 0u32;
+                            if modifiers.ctrl {
+                                mods |= config::HOTKEY_MOD_CTRL;
+                            }
+                            if modifiers.alt {
+                                mods |= config::HOTKEY_MOD_ALT;
+                            }
+                            if modifiers.shift {
+                                mods |= config::HOTKEY_MOD_SHIFT;
+                            }
+                            return Some(Ok((mods, vk)));
+                        }
+                    }
+                }
+                None
+            });
+            match captured {
+                Some(Err(())) => {
+                    self.hotkey_listen = false;
+                }
+                Some(Ok((mut mods, vk))) => {
+                    self.hotkey_listen = false;
+                    if mods == 0 && !config::is_function_vk(vk) {
+                        mods = if self.cfg.hotkey_mods != 0 {
+                            self.cfg.hotkey_mods
+                        } else {
+                            config::HOTKEY_MOD_CTRL | config::HOTKEY_MOD_ALT
+                        };
+                        self.hotkey_note = "Kept modifier keys so normal typing still works.".into();
+                    } else {
+                        self.hotkey_note.clear();
+                    }
+                    self.cfg.hotkey_mods = mods;
+                    self.cfg.hotkey_vk = vk;
+                    self.cfg.hotkey = true;
+                    let label = self.cfg.hotkey_label();
+                    self.say(format!("Hotkey set to {label} (tray updates within 2s)."));
+                }
+                None => {}
+            }
+            return;
+        }
+
         let (k, digit) = ctx.input(|i| {
             let k = i.modifiers.command && i.key_pressed(egui::Key::K);
             let keys = [
@@ -942,7 +1025,7 @@ impl Dash {
             pill(ui, "rust", AMBER);
             pill(ui, "esc/pos", CYAN);
         });
-        ui.label(mono("ctrl+end", DIM));
+        ui.label(mono(&self.cfg.hotkey_label().to_lowercase(), DIM));
         ui.label(mono("= print selection", DIM));
         ui.add_space(6.0);
         ui.hyperlink_to(mono("made by miketsak.gr", CYAN), "https://miketsak.gr");
@@ -1701,7 +1784,7 @@ impl Dash {
         section(ui, "01", "text", |ui| {
             ui.add(
                 egui::TextEdit::multiline(&mut self.txt)
-                    .hint_text("type anything, or press ctrl+end in any app to print what you selected")
+                    .hint_text(format!("type anything, or press {} in any app to print what you selected", self.cfg.hotkey_label().to_lowercase()))
                     .desired_rows(6)
                     .desired_width(f32::INFINITY),
             );
@@ -2470,7 +2553,47 @@ impl Dash {
                 });
                 ui.label(mono("optional: runs Pip quietly in your tray when you sign in to Windows", DIM));
                 ui.add_space(4.0);
-                toggle(ui, &mut self.cfg.hotkey, "Ctrl+End prints the selected text from any app");
+                let hk_label = self.cfg.hotkey_label();
+                toggle(ui, &mut self.cfg.hotkey, &format!("{hk_label} prints the selected text from any app"));
+                ui.horizontal_wrapped(|ui| {
+                    ui.add_space(22.0);
+                    let mut mod_toggle = |bit: u32, name: &str| {
+                        let mut on = self.cfg.hotkey_mods & bit != 0;
+                        if ui.checkbox(&mut on, name).changed() {
+                            let next = if on { self.cfg.hotkey_mods | bit } else { self.cfg.hotkey_mods & !bit };
+                            if next == 0 && !config::is_function_vk(self.cfg.hotkey_vk) {
+                                self.hotkey_note = "Keep at least one modifier key (or pick F1-F24 / Insert).".into();
+                            } else {
+                                self.cfg.hotkey_mods = next;
+                                self.hotkey_note.clear();
+                            }
+                        }
+                    };
+                    mod_toggle(config::HOTKEY_MOD_CTRL, "Ctrl");
+                    mod_toggle(config::HOTKEY_MOD_ALT, "Alt");
+                    mod_toggle(config::HOTKEY_MOD_SHIFT, "Shift");
+                    mod_toggle(config::HOTKEY_MOD_WIN, "Win");
+                    pill(ui, &config::vk_label(self.cfg.hotkey_vk), CYAN);
+                    let rec_label = if self.hotkey_listen { "press any key... (Esc cancels)" } else { "set key" };
+                    if ui.add(
+                        egui::Button::new(RichText::new(rec_label).monospace().color(INK).strong())
+                            .fill(if self.hotkey_listen { AMBER } else { CYAN })
+                            .corner_radius(CornerRadius::same(8)),
+                    ).clicked() {
+                        self.hotkey_listen = !self.hotkey_listen;
+                        self.hotkey_note.clear();
+                    }
+                    if ghost(ui, "reset Ctrl+Alt+P").clicked() {
+                        self.hotkey_listen = false;
+                        self.cfg.hotkey_mods = config::HOTKEY_MOD_CTRL | config::HOTKEY_MOD_ALT;
+                        self.cfg.hotkey_vk = b'P' as u32;
+                        self.hotkey_note.clear();
+                    }
+                });
+                if !self.hotkey_note.is_empty() {
+                    ui.label(mono(&self.hotkey_note, AMBER));
+                }
+                ui.add_space(4.0);
                 toggle(ui, &mut self.cfg.setup_dismissed, "hide the getting-started list on Home");
             }),
             2 => self.set_calendar(ui),
@@ -2486,7 +2609,7 @@ impl Dash {
                                 ui.label(mono("with rust. mit license.", DIM));
                             });
                             ui.label(mono(&format!("settings: {}", config::dir().display()), DIM));
-                            ui.label(mono("shortcuts: ctrl+k search, ctrl+1..7 pages, ctrl+end print selection", DIM));
+                            ui.label(mono(&format!("shortcuts: ctrl+k search, ctrl+1..7 pages, {} print selection", self.cfg.hotkey_label().to_lowercase()), DIM));
                         });
                     });
                 });

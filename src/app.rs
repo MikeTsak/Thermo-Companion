@@ -258,16 +258,31 @@ where
 
 /// Global hotkey: copy what is selected (or fall back to the clipboard) and print it.
 pub fn hotkey_print(sh: &Shared) -> Result<&'static str, String> {
-    sysinfo::wait_hotkey_released(1500);
-    let before = sysinfo::clipboard_text();
+    let cfg = sh.cfg();
+    sysinfo::wait_hotkey_released(cfg.hotkey_vk, 1500);
+    let seq_before = sysinfo::clipboard_seq();
+    let before = sysinfo::clipboard_text_retry(5);
     sysinfo::send_copy();
-    std::thread::sleep(Duration::from_millis(180));
-    let text = sysinfo::clipboard_text()
+
+    // Poll until the focused app updates the clipboard (Chromium/Keep can take 200-400ms via IPC).
+    let mut copied = None;
+    let deadline = Instant::now() + Duration::from_millis(650);
+    while Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(25));
+        if sysinfo::clipboard_seq() != seq_before {
+            if let Some(t) = sysinfo::clipboard_text_retry(8).filter(|t| !t.trim().is_empty()) {
+                copied = Some(t);
+                break;
+            }
+        }
+    }
+
+    let text = copied
         .or(before)
         .filter(|t| !t.trim().is_empty())
         .ok_or("nothing selected and the clipboard is empty")?;
     let opts = TextOpts { bold: false, big: false, center: false, stamp: true, checklist: false };
-    sh.print(escpos::text_slip(&sh.cfg(), &text, &opts))?;
+    sh.print(escpos::text_slip(&cfg, &text, &opts))?;
     Ok("Printed your selection")
 }
 
@@ -327,7 +342,7 @@ pub fn scheduler(sh: Arc<Shared>, notify: Notify) {
             notify(); // lets the tray refresh its menu / hotkey
         }
         tick(&sh, &notify, &mut st);
-        std::thread::sleep(Duration::from_secs(5));
+        std::thread::sleep(Duration::from_secs(2));
     }
 }
 

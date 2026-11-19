@@ -119,51 +119,94 @@ pub fn running_programs() -> HashSet<String> {
     set
 }
 
+pub fn clipboard_seq() -> u32 {
+    unsafe { GetClipboardSequenceNumber() }
+}
+
 pub fn clipboard_text() -> Option<String> {
-    unsafe {
-        if OpenClipboard(null_mut()) == 0 {
-            return None;
-        }
-        let mut out = None;
-        let h = GetClipboardData(CF_UNICODETEXT);
-        if !h.is_null() {
-            let p = GlobalLock(h) as *const u16;
-            if !p.is_null() {
-                let mut len = 0;
-                while *p.add(len) != 0 {
-                    len += 1;
+    clipboard_text_retry(4)
+}
+
+pub fn clipboard_text_retry(attempts: usize) -> Option<String> {
+    for i in 0..attempts.max(1) {
+        unsafe {
+            if OpenClipboard(null_mut()) != 0 {
+                let mut out = None;
+                let h = GetClipboardData(CF_UNICODETEXT);
+                if !h.is_null() {
+                    let p = GlobalLock(h) as *const u16;
+                    if !p.is_null() {
+                        let mut len = 0;
+                        while *p.add(len) != 0 {
+                            len += 1;
+                        }
+                        out = Some(String::from_utf16_lossy(std::slice::from_raw_parts(p, len)));
+                        GlobalUnlock(h);
+                    }
                 }
-                out = Some(String::from_utf16_lossy(std::slice::from_raw_parts(p, len)));
-                GlobalUnlock(h);
+                CloseClipboard();
+                return out;
             }
         }
-        CloseClipboard();
-        out
+        if i + 1 < attempts {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
     }
+    None
 }
 
 fn key_down(vk: i32) -> bool {
     unsafe { (GetAsyncKeyState(vk) as u16 & 0x8000) != 0 }
 }
 
-/// Wait (up to `ms`) until Ctrl and End are released, so a synthetic Ctrl+C isn't mangled.
-pub fn wait_hotkey_released(ms: u64) {
+fn any_hotkey_down(vk: u32) -> bool {
+    let mods = [
+        VK_CONTROL,
+        VK_LCONTROL,
+        VK_RCONTROL,
+        VK_MENU,
+        VK_LMENU,
+        VK_RMENU,
+        VK_SHIFT,
+        VK_LSHIFT,
+        VK_RSHIFT,
+        VK_LWIN,
+        VK_RWIN,
+    ];
+    mods.iter().any(|&k| key_down(k)) || (vk != 0 && key_down(vk as i32))
+}
+
+/// Wait (up to `ms`) until modifiers and the hotkey itself are released, so synthetic Ctrl+C isn't mangled.
+pub fn wait_hotkey_released(vk: u32, ms: u64) {
     let start = std::time::Instant::now();
-    while start.elapsed().as_millis() < ms as u128
-        && (key_down(VK_CONTROL) || key_down(VK_END))
-    {
+    while start.elapsed().as_millis() < ms as u128 && any_hotkey_down(vk) {
         std::thread::sleep(std::time::Duration::from_millis(15));
+    }
+    // Brief settle so browsers/editors exit Alt/menu state cleanly before receiving Ctrl+C.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+}
+
+fn send_vk(vk: u16, flags: u32) {
+    unsafe {
+        let mut inp: INPUT = zeroed();
+        inp.type_ = INPUT_KEYBOARD;
+        let ki = inp.u.ki_mut();
+        ki.wVk = vk;
+        ki.wScan = MapVirtualKeyW(vk as u32, MAPVK_VK_TO_VSC) as u16;
+        ki.dwFlags = flags;
+        SendInput(1, &mut inp, size_of::<INPUT>() as i32);
     }
 }
 
-/// Press Ctrl+C in whatever window has focus.
+/// Press Ctrl+C in whatever window has focus (paced SendInput so Chromium/Electron apps register it).
 pub fn send_copy() {
-    unsafe {
-        keybd_event(VK_CONTROL as u8, 0, 0, 0);
-        keybd_event(b'C', 0, 0, 0);
-        keybd_event(b'C', 0, KEYEVENTF_KEYUP, 0);
-        keybd_event(VK_CONTROL as u8, 0, KEYEVENTF_KEYUP, 0);
-    }
+    send_vk(VK_CONTROL as u16, 0);
+    std::thread::sleep(std::time::Duration::from_millis(15));
+    send_vk(b'C' as u16, 0);
+    std::thread::sleep(std::time::Duration::from_millis(15));
+    send_vk(b'C' as u16, KEYEVENTF_KEYUP);
+    std::thread::sleep(std::time::Duration::from_millis(15));
+    send_vk(VK_CONTROL as u16, KEYEVENTF_KEYUP);
 }
 
 /// Bring the window with this exact title to the front. Returns whether it was found.
