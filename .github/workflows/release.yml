@@ -1,0 +1,36 @@
+name: release
+
+# Push a tag like v0.1.0 to build Setup.exe and publish a GitHub release.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --locked
+      - run: cargo build --release --locked
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --no-progress -y
+      - name: Build installer
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}".TrimStart("v")
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DAppVersion=$version" installer\thermo-companion.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed" }
+      - name: Publish release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $setup = Get-ChildItem dist\ThermoCompanion-Setup-*.exe | Select-Object -First 1
+          $hash = (Get-FileHash $setup.FullName -Algorithm SHA256).Hash
+          "$hash  $($setup.Name)" | Out-File dist\SHA256SUMS.txt -Encoding ascii
+          gh release create "${{ github.ref_name }}" $setup.FullName target\release\thermo-companion.exe dist\SHA256SUMS.txt --generate-notes

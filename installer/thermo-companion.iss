@@ -1,0 +1,56 @@
+; Inno Setup script for Thermo Companion.
+; Build:  ISCC /DAppVersion=0.1.0 installer\thermo-companion.iss   (or installer\build.ps1)
+
+#ifndef AppVersion
+  #define AppVersion "0.1.0"
+#endif
+#define AppExe "thermo-companion.exe"
+
+[Setup]
+AppId={{B4E0A6C1-3D52-4F8B-9A17-6C2E5D8F0A39}
+AppName=Thermo Companion
+AppVersion={#AppVersion}
+AppPublisher=Thermo Companion
+DefaultDirName={autopf}\Thermo Companion
+DefaultGroupName=Thermo Companion
+DisableProgramGroupPage=yes
+; Per-user install by default: no admin prompt. The user can still pick "all users".
+PrivilegesRequired=lowest
+PrivilegesRequiredOverridesAllowed=dialog
+OutputDir=..\dist
+OutputBaseFilename=ThermoCompanion-Setup-{#AppVersion}
+SetupIconFile=..\assets\icon.ico
+UninstallDisplayIcon={app}\icon.ico
+UninstallDisplayName=Thermo Companion
+Compression=lzma2
+SolidCompression=yes
+WizardStyle=modern
+ArchitecturesAllowed=x64compatible
+ArchitecturesInstallIn64BitMode=x64compatible
+; Same name the app uses for its single-instance mutex: setup/uninstall ask you to close it.
+AppMutex=ThermoCompanionSingleton,ThermoCompanionDashboard
+LicenseFile=..\LICENSE
+
+[Tasks]
+Name: "startup"; Description: "Start Thermo Companion when Windows starts"; GroupDescription: "Options:"
+Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Options:"; Flags: unchecked
+
+[Files]
+Source: "..\target\release\{#AppExe}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\assets\icon.ico"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
+
+[Icons]
+Name: "{autoprograms}\Thermo Companion"; Filename: "{app}\{#AppExe}"; IconFilename: "{app}\icon.ico"
+Name: "{autodesktop}\Thermo Companion"; Filename: "{app}\{#AppExe}"; IconFilename: "{app}\icon.ico"; Tasks: desktopicon
+
+[Registry]
+Root: HKA; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "ThermoCompanion"; ValueData: """{app}\{#AppExe}"""; Flags: uninsdeletevalue; Tasks: startup
+
+[Run]
+Filename: "{app}\{#AppExe}"; Description: "Start Pip now"; Flags: nowait postinstall skipifsilent; Tasks: startup
+Filename: "{app}\{#AppExe}"; Parameters: "--no-autostart"; Description: "Start Pip now"; Flags: nowait postinstall skipifsilent; Tasks: not startup
+
+[UninstallRun]
+Filename: "{sys}\taskkill.exe"; Parameters: "/im {#AppExe} /f"; Flags: runhidden; RunOnceId: "StopThermoCompanion"

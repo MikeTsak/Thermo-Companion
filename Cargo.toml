@@ -1,0 +1,31 @@
+[package]
+name = "thermo-companion"
+version = "0.2.0"
+edition = "2021"
+description = "Thermo Companion: Pip, a tiny desk buddy that prints your calendar, tasks, alerts and more on an ESC/POS receipt printer (Windows)"
+license = "MIT"
+readme = "README.md"
+
+[dependencies]
+native-windows-gui = "1.0"
+eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+winreg = "0.52"
+winapi = { version = "0.3", features = [
+    "winspool", "errhandlingapi", "winnt", "minwindef", "synchapi", "winuser", "winbase",
+    "fileapi", "processthreadsapi", "handleapi", "sysinfoapi", "tlhelp32",
+] }
+# TLS via the Windows built-in SChannel: no C compiler needed, no OpenSSL.
+ureq = { version = "2.10", default-features = false, features = ["native-tls", "json"] }
+native-tls = "0.2"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "gif", "webp"] }
+qrcode = { version = "0.14", default-features = false }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
