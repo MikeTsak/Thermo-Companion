@@ -57,7 +57,7 @@ pub fn say(mood: Mood, hour: u32, slot: u64) -> &'static str {
     const EVENING: &[&str] = &[
         "wrapping up? i can print your end-of-day receipt.",
         "evening! your tasks are looking brave.",
-        "ctrl+alt+p anywhere and i'll print what you selected.",
+        "ctrl+end anywhere and i'll print what you selected.",
     ];
     const NIGHT: &[&str] = &[
         "it's late... even robots need sleep. zzz.",
@@ -68,7 +68,7 @@ pub fn say(mood: Mood, hour: u32, slot: u64) -> &'static str {
         "tip: pomodoro slips make great desk trophies.",
         "tip: i can print your wi-fi as a QR code for guests.",
         "tip: set a morning briefing and wake up to a receipt.",
-        "tip: ctrl+alt+p prints whatever text you have selected.",
+        "tip: ctrl+end prints whatever text you have selected.",
     ];
     const SAD: &[&str] = &[
         "i can't find my printer... is it plugged in and on?",

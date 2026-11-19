@@ -22,7 +22,7 @@ use std::cell::Cell;
 use std::ptr::null_mut;
 use std::rc::Rc;
 use std::sync::Arc;
-use winapi::um::winuser::{RegisterHotKey, UnregisterHotKey, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, WM_HOTKEY};
+use winapi::um::winuser::{RegisterHotKey, UnregisterHotKey, MOD_CONTROL, MOD_NOREPEAT, VK_END, WM_HOTKEY};
 
 pub const TITLE: &str = "Thermo Companion";
 const HOTKEY_ID: i32 = 0x7C01;
@@ -123,7 +123,7 @@ fn build(shared: Arc<Shared>) -> Result<Tray, nwg::NwgError> {
     let t_agenda = item("Agenda every morning")?;
     let t_briefing = item("Morning briefing")?;
     let t_stubs = item("Stub before events")?;
-    let t_hotkey = item("Hotkey Ctrl+Alt+P prints selection")?;
+    let t_hotkey = item("Hotkey Ctrl+End prints selection")?;
     let t_startup = item("Start with Windows")?;
     let sep3 = sep()?;
     let mi_quit = item("Quit")?;
@@ -174,7 +174,7 @@ impl Tray {
         self.t_startup.set_checked(c.start_with_windows);
     }
 
-    /// Register or release Ctrl+Alt+P to match the setting.
+    /// Register or release Ctrl+End to match the setting.
     fn apply_hotkey(&self) {
         let want = self.shared.cfg().hotkey;
         if want == self.hotkey_on.get() {
@@ -183,10 +183,10 @@ impl Tray {
         if let Some(hwnd) = self.host.handle.hwnd() {
             unsafe {
                 if want {
-                    let ok = RegisterHotKey(hwnd as _, HOTKEY_ID, (MOD_CONTROL | MOD_ALT | MOD_NOREPEAT) as u32, b'P' as u32);
+                    let ok = RegisterHotKey(hwnd as _, HOTKEY_ID, (MOD_CONTROL | MOD_NOREPEAT) as u32, VK_END as u32);
                     self.hotkey_on.set(ok != 0);
                     if ok == 0 {
-                        config::log("Ctrl+Alt+P is already taken by another program");
+                        config::log("Ctrl+End is already taken by another program");
                     }
                 } else {
                     UnregisterHotKey(hwnd as _, HOTKEY_ID);
@@ -325,7 +325,7 @@ fn run_tray() {
     let t = tray.clone();
     let _handler = nwg::full_bind_event_handler(&tray.host.handle, move |e, _d, h| on_event(&t, e, h));
 
-    // Ctrl+Alt+P: print what is selected.
+    // Ctrl+End: print what is selected.
     let t = tray.clone();
     let _raw = nwg::bind_raw_event_handler(&tray.host.handle, 0x10000, move |_hwnd, msg, w, _l| {
         if msg == WM_HOTKEY && w as i32 == HOTKEY_ID {

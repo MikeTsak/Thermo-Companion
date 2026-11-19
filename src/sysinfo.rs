@@ -146,11 +146,11 @@ fn key_down(vk: i32) -> bool {
     unsafe { (GetAsyncKeyState(vk) as u16 & 0x8000) != 0 }
 }
 
-/// Wait (up to `ms`) until Ctrl, Alt and P are released, so a synthetic Ctrl+C isn't mangled.
+/// Wait (up to `ms`) until Ctrl and End are released, so a synthetic Ctrl+C isn't mangled.
 pub fn wait_hotkey_released(ms: u64) {
     let start = std::time::Instant::now();
     while start.elapsed().as_millis() < ms as u128
-        && (key_down(VK_CONTROL) || key_down(VK_MENU) || key_down(b'P' as i32))
+        && (key_down(VK_CONTROL) || key_down(VK_END))
     {
         std::thread::sleep(std::time::Duration::from_millis(15));
     }

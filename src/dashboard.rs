@@ -942,7 +942,7 @@ impl Dash {
             pill(ui, "rust", AMBER);
             pill(ui, "esc/pos", CYAN);
         });
-        ui.label(mono("ctrl+alt+p", DIM));
+        ui.label(mono("ctrl+end", DIM));
         ui.label(mono("= print selection", DIM));
         ui.add_space(6.0);
         ui.hyperlink_to(mono("made by miketsak.gr", CYAN), "https://miketsak.gr");
@@ -1701,7 +1701,7 @@ impl Dash {
         section(ui, "01", "text", |ui| {
             ui.add(
                 egui::TextEdit::multiline(&mut self.txt)
-                    .hint_text("type anything, or press ctrl+alt+p in any app to print what you selected")
+                    .hint_text("type anything, or press ctrl+end in any app to print what you selected")
                     .desired_rows(6)
                     .desired_width(f32::INFINITY),
             );
@@ -2470,7 +2470,7 @@ impl Dash {
                 });
                 ui.label(mono("optional: runs Pip quietly in your tray when you sign in to Windows", DIM));
                 ui.add_space(4.0);
-                toggle(ui, &mut self.cfg.hotkey, "Ctrl+Alt+P prints the selected text from any app");
+                toggle(ui, &mut self.cfg.hotkey, "Ctrl+End prints the selected text from any app");
                 toggle(ui, &mut self.cfg.setup_dismissed, "hide the getting-started list on Home");
             }),
             2 => self.set_calendar(ui),
@@ -2486,7 +2486,7 @@ impl Dash {
                                 ui.label(mono("with rust. mit license.", DIM));
                             });
                             ui.label(mono(&format!("settings: {}", config::dir().display()), DIM));
-                            ui.label(mono("shortcuts: ctrl+k search, ctrl+1..7 pages, ctrl+alt+p print selection", DIM));
+                            ui.label(mono("shortcuts: ctrl+k search, ctrl+1..7 pages, ctrl+end print selection", DIM));
                         });
                     });
                 });
