@@ -61,6 +61,11 @@ pub struct Config {
     pub mail: bool,
     pub mail_label: String,
 
+    // calendar: a private iCal link (easy) or Google sign-in (calendar + mail)
+    pub ical_url: String,
+    pub did_test: bool,
+    pub setup_dismissed: bool,
+
     // google
     pub google_client_id: String,
     pub google_client_secret: String,
@@ -118,6 +123,10 @@ impl Default for Config {
             mail: false,
             mail_label: "IMPORTANT".into(),
 
+            ical_url: String::new(),
+            did_test: false,
+            setup_dismissed: false,
+
             google_client_id: String::new(),
             google_client_secret: String::new(),
             google_refresh_token: String::new(),
@@ -127,6 +136,13 @@ impl Default for Config {
             last_briefing_date: String::new(),
             last_eod_date: String::new(),
         }
+    }
+}
+
+impl Config {
+    /// True when events can be read (iCal link or Google sign-in).
+    pub fn calendar_linked(&self) -> bool {
+        !self.ical_url.trim().is_empty() || !self.google_refresh_token.is_empty()
     }
 }
 

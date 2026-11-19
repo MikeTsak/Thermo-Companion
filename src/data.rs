@@ -32,6 +32,42 @@ pub struct Reminder {
     /// RFC 3339, local time zone.
     pub due: String,
     pub fired: bool,
+    /// "" (once), "daily", "weekdays" or "weekly".
+    pub repeat: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(default)]
+pub struct NoteItem {
+    pub text: String,
+    pub done: bool,
+}
+
+/// A Keep-style note: text or a checklist, with a colour, pin, labels and archive.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(default)]
+pub struct Note {
+    pub id: u64,
+    pub title: String,
+    pub body: String,
+    pub checklist: bool,
+    pub items: Vec<NoteItem>,
+    /// Index into the dashboard's colour list.
+    pub color: u8,
+    pub pinned: bool,
+    pub archived: bool,
+    pub labels: Vec<String>,
+    /// RFC 3339.
+    pub updated: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(default)]
+pub struct Countdown {
+    pub id: u64,
+    pub name: String,
+    /// YYYY-MM-DD
+    pub date: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -60,6 +96,8 @@ pub struct Data {
     pub todos: Vec<Todo>,
     pub habits: Vec<Habit>,
     pub reminders: Vec<Reminder>,
+    pub notes: Vec<Note>,
+    pub countdowns: Vec<Countdown>,
     pub pomodoro: Pomodoro,
     /// Date -> finished focus sessions.
     pub pomo_sessions: BTreeMap<String, u32>,

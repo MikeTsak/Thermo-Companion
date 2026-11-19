@@ -1,7 +1,7 @@
 //! ESC/POS slip builders. Every function returns the raw bytes for one slip.
 
 use crate::config::Config;
-use crate::data::{DayUsage, Habit, Todo};
+use crate::data::{DayUsage, Habit, Note, Todo};
 use crate::gcal::Event;
 use crate::net::{Mail, Weather};
 use crate::pip::{self, Mood};
@@ -137,9 +137,38 @@ impl<'a> Slip<'a> {
         }
     }
 
+    /// Text size multiplier 1..=6 (both width and height).
+    pub fn scale(&mut self, n: u8) {
+        let n = n.clamp(1, 6) - 1;
+        self.buf.extend_from_slice(&[GS, b'!', (n << 4) | n]);
+    }
+
+    /// A Code 39 barcode with the text printed under it.
+    pub fn barcode(&mut self, text: &str) {
+        let data: Vec<u8> = text
+            .to_uppercase()
+            .bytes()
+            .filter(|b| b.is_ascii_digit() || b.is_ascii_uppercase() || b" -.$/+%".contains(b))
+            .collect();
+        if data.is_empty() {
+            return;
+        }
+        self.center();
+        self.buf.extend_from_slice(&[GS, b'h', 64, GS, b'w', 2, GS, b'H', 2]);
+        self.buf.extend_from_slice(&[GS, b'k', 69, data.len() as u8]);
+        self.buf.extend_from_slice(&data);
+        self.buf.push(b'\n');
+        self.left();
+    }
+
     /// Feed the paper past the cutter and cut.
     pub fn finish_with(mut self, mood: Mood) -> Vec<u8> {
         self.sticker(mood);
+        self.finish_plain()
+    }
+
+    /// Cut without a sticker.
+    pub fn finish_plain(mut self) -> Vec<u8> {
         self.feed(4);
         self.buf.extend_from_slice(&[GS, b'V', 66, 3]);
         self.buf
@@ -194,6 +223,29 @@ fn money(x: f64) -> String {
 
 fn hm(minutes: u32) -> String {
     format!("{}h {:02}m", minutes / 60, minutes % 60)
+}
+
+fn days_left(days: i64) -> String {
+    match days {
+        0 => "TODAY!".to_string(),
+        1 => "tomorrow".to_string(),
+        d if d < 0 => format!("{} d ago", -d),
+        d => format!("{d} days"),
+    }
+}
+
+fn field(s: &mut Slip, label: &str, value: &str) {
+    if value.trim().is_empty() {
+        return;
+    }
+    s.bold(true);
+    s.put(label);
+    s.bold(false);
+    s.para(value);
+}
+
+fn serial() -> String {
+    format!("PIP-{}-{:04}", Local::now().format("%y%m%d"), crate::pip::rand(10000))
 }
 
 // ---------------------------------------------------------------- slips
@@ -262,6 +314,7 @@ pub fn briefing(
     events: &[Event],
     weather: Option<&Weather>,
     todos: &[Todo],
+    countdowns: &[(String, i64)],
     quote: &str,
 ) -> Vec<u8> {
     let mut s = Slip::new(cfg);
@@ -296,6 +349,15 @@ pub fn briefing(
         }
         if open.len() > 8 {
             s.line(&format!("...and {} more", open.len() - 8));
+        }
+    }
+    if !countdowns.is_empty() {
+        s.rule();
+        s.bold(true);
+        s.line("COUNTDOWNS");
+        s.bold(false);
+        for (name, days) in countdowns.iter().take(3) {
+            s.item(name, &days_left(*days));
         }
     }
     s.rule();
@@ -521,6 +583,223 @@ pub fn sticker_slip(cfg: &Config, mood: Mood) -> Vec<u8> {
     let mut buf = s.buf;
     buf.extend_from_slice(&[ESC, b'd', 4, GS, b'V', 66, 3]);
     buf
+}
+
+/// A Keep-style note as a slip.
+pub fn note_slip(cfg: &Config, n: &Note) -> Vec<u8> {
+    let mut s = Slip::new(cfg);
+    s.rule();
+    if !n.title.trim().is_empty() {
+        s.bold(true);
+        s.para(&n.title);
+        s.bold(false);
+        s.rule();
+    }
+    if n.checklist {
+        for it in &n.items {
+            let mark = if it.done { "[x] " } else { "[ ] " };
+            let p = s.prep(&it.text);
+            for (i, l) in wrap(&p, s.width().saturating_sub(4)).iter().enumerate() {
+                s.put(&format!("{}{}", if i == 0 { mark } else { "    " }, l));
+            }
+        }
+    } else {
+        for line in n.body.lines() {
+            if line.trim().is_empty() {
+                s.put("");
+            } else {
+                s.para(line);
+            }
+        }
+    }
+    if !n.labels.is_empty() {
+        s.line(&n.labels.iter().map(|l| format!("#{l}")).collect::<Vec<_>>().join(" "));
+    }
+    s.rule();
+    s.finish_with(Mood::Wink)
+}
+
+pub fn event_ticket(cfg: &Config, name: &str, when: &str, venue: &str, seat: &str, price: &str) -> Vec<u8> {
+    let mut s = Slip::new(cfg);
+    s.rule();
+    s.center();
+    s.bold(true);
+    s.line("*  ADMIT ONE  *");
+    s.big(true);
+    let half = s.width() / 2;
+    let p = s.prep(name);
+    for l in wrap(&p, half) {
+        s.put(&l);
+    }
+    s.big(false);
+    s.bold(false);
+    s.left();
+    s.rule();
+    field(&mut s, "DATE", when);
+    field(&mut s, "WHERE", venue);
+    field(&mut s, "SEAT", seat);
+    field(&mut s, "PRICE", price);
+    s.rule();
+    s.barcode(&serial());
+    s.finish_with(Mood::Party)
+}
+
+pub fn boarding_pass(cfg: &Config, from: &str, to: &str, when: &str, flight: &str, seat: &str, who: &str) -> Vec<u8> {
+    let mut s = Slip::new(cfg);
+    s.title("BOARDING PASS");
+    s.rule();
+    s.center();
+    s.line("FROM");
+    s.bold(true);
+    s.big(true);
+    let half = s.width() / 2;
+    for l in wrap(&s.prep(from), half) {
+        s.put(&l);
+    }
+    s.big(false);
+    s.bold(false);
+    s.line("TO");
+    s.bold(true);
+    s.big(true);
+    for l in wrap(&s.prep(to), half) {
+        s.put(&l);
+    }
+    s.big(false);
+    s.bold(false);
+    s.left();
+    s.rule();
+    field(&mut s, "DATE", when);
+    field(&mut s, "FLIGHT", flight);
+    field(&mut s, "SEAT / GATE", seat);
+    field(&mut s, "PASSENGER", who);
+    s.rule();
+    s.barcode(&serial());
+    s.finish_with(Mood::Wink)
+}
+
+/// Big text for labels, one slip per copy.
+pub fn big_label(cfg: &Config, text: &str, scale: u8, copies: u8) -> Vec<u8> {
+    let scale = scale.clamp(1, 6);
+    let mut out = Vec::new();
+    for _ in 0..copies.clamp(1, 10) {
+        let mut s = Slip::new(cfg);
+        let width = (s.width() / scale as usize).max(1);
+        s.rule();
+        s.center();
+        s.bold(true);
+        s.scale(scale);
+        let p = s.prep(text);
+        for l in wrap(&p, width) {
+            s.put(&l);
+        }
+        s.scale(1);
+        s.bold(false);
+        s.left();
+        s.rule();
+        out.extend(s.finish_plain());
+    }
+    out
+}
+
+/// Monday to Sunday with the week's events and room to write.
+pub fn week_planner(cfg: &Config, monday: NaiveDate, events: &[Event], todos: &[Todo]) -> Vec<u8> {
+    let mut s = Slip::new(cfg);
+    s.title("WEEK PLANNER");
+    s.center();
+    s.line(&format!("{} - {}", monday.format("%d %b"), (monday + chrono::Duration::days(6)).format("%d %b %Y")));
+    s.left();
+    s.rule();
+    let text_width = s.width().saturating_sub(8).max(8);
+    for i in 0..7 {
+        let day = monday + chrono::Duration::days(i);
+        s.bold(true);
+        s.line(&day.format("%a %d %b").to_string());
+        s.bold(false);
+        for e in events.iter().filter(|e| e.start.date_naive() == day) {
+            let when = if e.all_day { "all day".to_string() } else { e.start.format("%H:%M").to_string() };
+            let title = s.prep(&e.summary);
+            for (k, l) in wrap(&title, text_width).iter().enumerate() {
+                let head = if k == 0 { format!("  {:<5} ", when) } else { " ".repeat(8) };
+                s.put(&format!("{head}{l}"));
+            }
+        }
+        s.put(&format!("  {}", ".".repeat(s.width().saturating_sub(4))));
+        s.put(&format!("  {}", ".".repeat(s.width().saturating_sub(4))));
+    }
+    let open: Vec<&Todo> = todos.iter().filter(|t| !t.done).collect();
+    if !open.is_empty() {
+        s.rule();
+        s.bold(true);
+        s.line("TO-DO");
+        s.bold(false);
+        for t in open.iter().take(10) {
+            let p = s.prep(&t.text);
+            for (k, l) in wrap(&p, s.width().saturating_sub(4)).iter().enumerate() {
+                s.put(&format!("{}{}", if k == 0 { "[ ] " } else { "    " }, l));
+            }
+        }
+    }
+    s.rule();
+    s.finish()
+}
+
+/// Days left until things you care about.
+pub fn countdown_slip(cfg: &Config, items: &[(String, i64)]) -> Vec<u8> {
+    let mut s = Slip::new(cfg);
+    s.title("COUNTDOWN");
+    s.rule();
+    if items.is_empty() {
+        s.line("Nothing to count down to yet.");
+    }
+    for (name, days) in items {
+        s.item(name, &days_left(*days));
+    }
+    s.rule();
+    s.finish_with(Mood::Party)
+}
+
+/// Fortune cookie / joke.
+pub fn fortune_slip(cfg: &Config, heading: &str, text: &str, lucky_numbers: bool) -> Vec<u8> {
+    let mut s = Slip::new(cfg);
+    s.title(heading);
+    s.rule();
+    s.center();
+    s.bold(true);
+    s.para(text);
+    s.bold(false);
+    if lucky_numbers {
+        let nums: Vec<String> = (0..6).map(|_| format!("{:02}", 1 + crate::pip::rand(49))).collect();
+        s.put("");
+        s.line(&format!("Lucky numbers: {}", nums.join(" ")));
+    }
+    s.left();
+    s.rule();
+    s.finish_with(Mood::Wink)
+}
+
+/// "Pip decides": coin, dice, 8-ball or a pick from a list.
+pub fn decide_slip(cfg: &Config, question: &str, answer: &str) -> Vec<u8> {
+    let mut s = Slip::new(cfg);
+    s.title("PIP DECIDES");
+    if !question.trim().is_empty() {
+        s.center();
+        s.para(question);
+        s.left();
+    }
+    s.rule();
+    s.center();
+    s.bold(true);
+    s.big(true);
+    let half = s.width() / 2;
+    for l in wrap(&s.prep(answer), half) {
+        s.put(&l);
+    }
+    s.big(false);
+    s.bold(false);
+    s.left();
+    s.rule();
+    s.line(&Local::now().format("%a %d %b  %H:%M").to_string());
+    s.finish_with(Mood::Wink)
 }
 
 pub fn stub(cfg: &Config, e: &Event) -> Vec<u8> {

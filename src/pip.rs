@@ -92,6 +92,71 @@ pub fn say(mood: Mood, hour: u32, slot: u64) -> &'static str {
     }
 }
 
+/// A cheap pseudo-random number below `n` (clock + counter), good enough for coin flips.
+pub fn rand(n: usize) -> usize {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    static COUNTER: AtomicU64 = AtomicU64::new(0x9E37_79B9_7F4A_7C15);
+    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(1);
+    let mut x = nanos ^ COUNTER.fetch_add(0x9E37_79B9_7F4A_7C15, Ordering::Relaxed);
+    x ^= x >> 33;
+    x = x.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    x ^= x >> 33;
+    (x % n.max(1) as u64) as usize
+}
+
+pub fn fortune() -> &'static str {
+    const L: &[&str] = &[
+        "A small commit today saves a large merge tomorrow.",
+        "You will soon find the bug. It was a typo.",
+        "Someone is about to say thank you for your work.",
+        "The best time to take a break was an hour ago. The second best is now.",
+        "Your next idea will print beautifully.",
+        "Good things come to those who save their files.",
+        "A surprise is waiting in your inbox. Probably a nice one.",
+        "Today you are the main character. Act accordingly.",
+        "Fortune favours the one who backs things up.",
+        "Soon: coffee. Later: victory.",
+        "You will teach someone something small and it will matter.",
+        "Trust the process. Also trust Pip.",
+    ];
+    L[rand(L.len())]
+}
+
+pub fn joke() -> &'static str {
+    const L: &[&str] = &[
+        "Why do programmers prefer dark mode? Because light attracts bugs.",
+        "There are 10 kinds of people: those who get binary and those who don't.",
+        "I would tell you a UDP joke, but you might not get it.",
+        "A SQL query walks into a bar, sees two tables and asks: can I join you?",
+        "Why was the robot tired? It had a hard drive.",
+        "My printer and I have a great relationship. I print, it jams, we talk about it.",
+        "Real programmers count from zero. So this is joke number zero.",
+        "It works on my machine. Ship the machine.",
+        "To understand recursion, first understand recursion.",
+        "Why did the receipt go to therapy? Too many unresolved items.",
+    ];
+    L[rand(L.len())]
+}
+
+pub fn eight_ball() -> &'static str {
+    const L: &[&str] = &[
+        "Yes, definitely.",
+        "Without a doubt.",
+        "Signs point to yes.",
+        "Ask again after coffee.",
+        "Pip is not sure. Pip is a printer.",
+        "Don't count on it.",
+        "Very doubtful.",
+        "My sources say no.",
+        "Outlook good.",
+        "Reply hazy, try again.",
+        "Absolutely not.",
+        "Go for it!",
+    ];
+    L[rand(L.len())]
+}
+
 /// A line for printed slips (briefing, end of day).
 pub fn slip_line(slot: u64) -> &'static str {
     const LINES: &[&str] = &[
