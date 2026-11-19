@@ -1,6 +1,6 @@
 [package]
 name = "thermo-companion"
-version = "0.2.0"
+version = "0.2.2"
 edition = "2021"
 description = "Thermo Companion: Pip, a tiny desk buddy that prints your calendar, tasks, alerts and more on an ESC/POS receipt printer (Windows) — made by miketsak.gr"
 authors = ["miketsak.gr"]
