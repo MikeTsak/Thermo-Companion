@@ -69,6 +69,7 @@ pub struct Config {
     pub ical_url: String,
     pub did_test: bool,
     pub setup_dismissed: bool,
+    pub auto_check_updates: bool,
 
     // google
     pub google_client_id: String,
@@ -132,6 +133,7 @@ impl Default for Config {
             ical_url: String::new(),
             did_test: false,
             setup_dismissed: false,
+            auto_check_updates: false,
 
             google_client_id: String::new(),
             google_client_secret: String::new(),

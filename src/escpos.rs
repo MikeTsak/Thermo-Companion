@@ -829,9 +829,68 @@ pub fn stub(cfg: &Config, e: &Event) -> Vec<u8> {
     s.finish()
 }
 
-pub fn text_slip(cfg: &Config, text: &str, o: &TextOpts) -> Vec<u8> {
+fn format_text_lines(cfg: &Config, text: &str, o: &TextOpts) -> Vec<String> {
+    let base_w = cfg.paper_chars.max(16);
+    let width = if o.big { (base_w / 2).max(8) } else { base_w };
+    let prep = |s: &str| -> String {
+        if cfg.greeklish {
+            translit(s)
+        } else {
+            s.chars().map(fold).collect()
+        }
+    };
+    let mut out = Vec::new();
+    let text = text.replace("\r\n", "\n");
+    for raw in text.split('\n') {
+        let raw = raw.trim_end();
+        if raw.trim().is_empty() {
+            out.push(String::new());
+            continue;
+        }
+        if o.checklist {
+            let trimmed = raw.trim();
+            let (prefix, body) = if let Some(rest) = trimmed.strip_prefix("- [x]").or_else(|| trimmed.strip_prefix("- [X]")) {
+                ("[x] ", rest.trim())
+            } else if let Some(rest) = trimmed.strip_prefix("[x]").or_else(|| trimmed.strip_prefix("[X]")) {
+                ("[x] ", rest.trim())
+            } else {
+                let item = trimmed
+                    .trim_start_matches("- [ ]")
+                    .trim_start_matches("[ ]")
+                    .trim_start_matches("- ")
+                    .trim();
+                ("[ ] ", item)
+            };
+            let p = prep(body);
+            for (i, l) in wrap(&p, width.saturating_sub(4).max(1)).iter().enumerate() {
+                out.push(format!("{}{}", if i == 0 { prefix } else { "    " }, l));
+            }
+        } else {
+            let p = prep(raw);
+            out.extend(wrap(&p, width));
+        }
+    }
+    out
+}
+
+pub fn preview_text(cfg: &Config, text: &str, o: &TextOpts) -> String {
+    let mut lines = format_text_lines(cfg, text, o);
+    if o.stamp {
+        lines.push(Local::now().format("%d %b %Y  %H:%M").to_string());
+    }
+    lines.join("\n")
+}
+
+pub fn titled_text_slip(cfg: &Config, heading: Option<&str>, text: &str, o: &TextOpts) -> Vec<u8> {
     let mut s = Slip::new(cfg);
-    let width = if o.big { s.width() / 2 } else { s.width() };
+    if let Some(h) = heading.filter(|h| !h.trim().is_empty()) {
+        s.center();
+        s.bold(true);
+        s.line(h);
+        s.bold(false);
+        s.left();
+        s.rule();
+    }
     if o.center {
         s.center();
     }
@@ -841,32 +900,9 @@ pub fn text_slip(cfg: &Config, text: &str, o: &TextOpts) -> Vec<u8> {
     if o.big {
         s.big(true);
     }
-
-    let text = text.replace("\r\n", "\n");
-    for raw in text.split('\n') {
-        let raw = raw.trim_end();
-        if raw.trim().is_empty() {
-            s.put("");
-            continue;
-        }
-        if o.checklist {
-            let item = raw
-                .trim()
-                .trim_start_matches("[ ]")
-                .trim_start_matches("- ")
-                .trim();
-            let p = s.prep(item);
-            for (i, l) in wrap(&p, width.saturating_sub(4).max(1)).iter().enumerate() {
-                s.put(&format!("{}{}", if i == 0 { "[ ] " } else { "    " }, l));
-            }
-        } else {
-            let p = s.prep(raw);
-            for l in wrap(&p, width) {
-                s.put(&l);
-            }
-        }
+    for line in format_text_lines(cfg, text, o) {
+        s.put(&line);
     }
-
     s.bold(false);
     s.big(false);
     if o.stamp {
@@ -874,6 +910,10 @@ pub fn text_slip(cfg: &Config, text: &str, o: &TextOpts) -> Vec<u8> {
     }
     s.left();
     s.finish()
+}
+
+pub fn text_slip(cfg: &Config, text: &str, o: &TextOpts) -> Vec<u8> {
+    titled_text_slip(cfg, None, text, o)
 }
 
 pub fn test_slip(cfg: &Config) -> Vec<u8> {

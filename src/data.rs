@@ -91,6 +91,15 @@ pub struct DayUsage {
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 #[serde(default)]
+pub struct PrintJob {
+    pub id: u64,
+    pub label: String,
+    pub time: String,
+    pub hex: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(default)]
 pub struct Data {
     pub next_id: u64,
     pub todos: Vec<Todo>,
@@ -105,6 +114,38 @@ pub struct Data {
     pub mail_seen: Vec<String>,
     /// False until the first mail check has recorded what already exists.
     pub mail_ready: bool,
+    pub print_history: Vec<PrintJob>,
+    pub print_queue: Vec<PrintJob>,
+}
+
+pub fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        s.push(HEX[(b >> 4) as usize] as char);
+        s.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    s
+}
+
+pub fn hex_decode(s: &str) -> Option<Vec<u8>> {
+    let b = s.as_bytes();
+    if b.len() % 2 != 0 {
+        return None;
+    }
+    let val = |c: u8| -> Option<u8> {
+        match c {
+            b'0'..=b'9' => Some(c - b'0'),
+            b'a'..=b'f' => Some(c - b'a' + 10),
+            b'A'..=b'F' => Some(c - b'A' + 10),
+            _ => None,
+        }
+    };
+    let mut out = Vec::with_capacity(b.len() / 2);
+    for i in (0..b.len()).step_by(2) {
+        out.push((val(b[i])? << 4) | val(b[i + 1])?);
+    }
+    Some(out)
 }
 
 impl Data {
@@ -127,9 +168,14 @@ pub fn load() -> Data {
 
 fn save(d: &Data) {
     if let Ok(text) = serde_json::to_string_pretty(d) {
+        let target = path();
         let tmp = crate::config::dir().join("data.json.tmp");
-        if fs::write(&tmp, text).is_ok() {
-            let _ = fs::rename(&tmp, path());
+        if fs::write(&tmp, &text).is_ok() && fs::rename(&tmp, &target).is_err() {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            if fs::rename(&tmp, &target).is_err() {
+                let _ = fs::write(&target, &text);
+                let _ = fs::remove_file(&tmp);
+            }
         }
     }
 }

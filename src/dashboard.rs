@@ -532,6 +532,18 @@ impl Dash {
             app::spawn_job(&shared, notify.clone(), "Calendar updated", |s| s.refresh_events());
         }
 
+        let upd_check_slot: Arc<Mutex<Option<Result<update::CheckOutcome, String>>>> = Arc::new(Mutex::new(None));
+        let mut upd_busy = false;
+        if cfg.auto_check_updates {
+            upd_busy = true;
+            let slot = upd_check_slot.clone();
+            let n = notify.clone();
+            std::thread::spawn(move || {
+                *slot.lock().unwrap() = Some(update::check_latest());
+                n();
+            });
+        }
+
         // launch options: "notes-new", "connect", "palette", or "page" / "page/tab-number"
         let arg = arg.unwrap_or_default();
         let (page_name, tab_no) = match arg.split_once('/') {
@@ -628,11 +640,11 @@ impl Dash {
             cd_date: [today.year(), today.month() as i32, today.day() as i32],
             new_url: String::new(),
             new_proc: String::new(),
-            upd_busy: false,
+            upd_busy,
             upd_installing: false,
             upd_state: None,
             upd_err: String::new(),
-            upd_check_slot: Arc::new(Mutex::new(None)),
+            upd_check_slot,
             upd_apply_slot: Arc::new(Mutex::new(None)),
             hotkey_listen: false,
             hotkey_note: String::new(),
@@ -1368,6 +1380,41 @@ impl Dash {
 
         self.setup_checklist(ui);
 
+        if let Some(Ok(update::CheckOutcome::Available(rel))) = &self.upd_state {
+            let tag = rel.tag.clone();
+            card(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    pill(ui, &format!("update: {tag}"), AMBER);
+                    ui.label("A new Thermo Companion version is ready on GitHub.");
+                    if action(ui, "open updates", AMBER).clicked() {
+                        self.goto(Page::Settings, 3);
+                    }
+                });
+            });
+        }
+
+        if !self.data.print_queue.is_empty() {
+            let count = self.data.print_queue.len();
+            card(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    pill(ui, &format!("queued: {count}"), AMBER);
+                    ui.label("Waiting for your printer to come back online.");
+                    if action(ui, "retry now", GREEN).clicked() {
+                        self.job("Printed queued slips", |s| {
+                            let n = app::flush_print_queue(s)?;
+                            if n == 0 {
+                                return Err("Printer is still offline.".into());
+                            }
+                            Ok(())
+                        });
+                    }
+                    if ghost(ui, "clear queue").clicked() {
+                        self.change_data(|d| d.print_queue.clear());
+                    }
+                });
+            });
+        }
+
         // status tiles
         let (focus_value, focus_sub, focus_color) = match self.countdown() {
             Some((phase, secs)) => (fmt_countdown(secs), format!("{phase} - running"), AMBER),
@@ -1780,6 +1827,44 @@ impl Dash {
             5 => self.print_stickers(ui),
             _ => self.print_fun(ui),
         }
+        self.print_history_card(ui);
+    }
+
+    fn print_history_card(&mut self, ui: &mut Ui) {
+        if self.data.print_history.is_empty() && self.data.print_queue.is_empty() {
+            return;
+        }
+        section(ui, "log", "recent & queued slips", |ui| {
+            if !self.data.print_queue.is_empty() {
+                ui.horizontal_wrapped(|ui| {
+                    pill(ui, &format!("queued: {}", self.data.print_queue.len()), AMBER);
+                    if action(ui, "retry queue", GREEN).clicked() {
+                        self.job("Printed queued slips", |s| {
+                            let n = app::flush_print_queue(s)?;
+                            if n == 0 {
+                                return Err("Printer is still offline.".into());
+                            }
+                            Ok(())
+                        });
+                    }
+                    if ghost(ui, "clear queue").clicked() {
+                        self.change_data(|d| d.print_queue.clear());
+                    }
+                });
+            }
+            for job in self.data.print_history.clone() {
+                ui.horizontal(|ui| {
+                    ui.label(mono(&job.time, DIM));
+                    ui.label(&job.label);
+                    if ghost(ui, "reprint").clicked() {
+                        if let Some(bytes) = data::hex_decode(&job.hex) {
+                            let lbl = job.label.clone();
+                            self.job("Reprinted slip", move |s| s.print_as(&lbl, bytes));
+                        }
+                    }
+                });
+            }
+        });
     }
 
     fn print_text(&mut self, ui: &mut Ui) {
@@ -1797,11 +1882,13 @@ impl Dash {
                 toggle(ui, &mut self.t_stamp, "date and time");
                 toggle(ui, &mut self.t_check, "checklist");
             });
+            let opts = TextOpts { bold: self.t_bold, big: self.t_big, center: self.t_center, stamp: self.t_stamp, checklist: self.t_check };
             ui.horizontal(|ui| {
                 if action(ui, "print text", AMBER).clicked() && !self.txt.trim().is_empty() {
                     let text = self.txt.clone();
-                    let o = TextOpts { bold: self.t_bold, big: self.t_big, center: self.t_center, stamp: self.t_stamp, checklist: self.t_check };
-                    self.job("Printed", move |s| s.print(escpos::text_slip(&s.cfg(), &text, &o)));
+                    let label = format!("Text: {}", text.lines().next().unwrap_or("").chars().take(28).collect::<String>());
+                    let o = TextOpts { bold: opts.bold, big: opts.big, center: opts.center, stamp: opts.stamp, checklist: opts.checklist };
+                    self.job("Printed", move |s| s.print_as(&label, escpos::text_slip(&s.cfg(), &text, &o)));
                 }
                 if ghost(ui, "save as note").clicked() && !self.txt.trim().is_empty() {
                     let body = self.txt.trim_end().to_string();
@@ -1815,6 +1902,22 @@ impl Dash {
                     self.txt.clear();
                 }
             });
+            if !self.txt.trim().is_empty() {
+                ui.add_space(4.0);
+                let w = if self.t_big { (self.cfg.paper_chars.max(16) / 2).max(8) } else { self.cfg.paper_chars.max(16) };
+                ui.label(mono(&format!("receipt preview ({w} chars/line)"), DIM));
+                let preview = escpos::preview_text(&self.cfg, &self.txt, &opts);
+                let ruler: String = (0..w).map(|i| char::from(b'0' + ((i + 1) % 10) as u8)).collect();
+                egui::Frame::new()
+                    .fill(Color32::from_rgb(7, 10, 15))
+                    .stroke(Stroke::new(1.0, BORDER))
+                    .corner_radius(CornerRadius::same(8))
+                    .inner_margin(Margin::same(10))
+                    .show(ui, |ui| {
+                        ui.label(mono(&ruler, DIM));
+                        ui.label(mono(&preview, TEXT));
+                    });
+            }
         });
     }
 
@@ -2725,6 +2828,7 @@ impl Dash {
                 ui.hyperlink_to(mono("made by miketsak.gr", CYAN), "https://miketsak.gr");
                 ui.label(mono(&format!(" |  github: {}", update::REPO), DIM));
             });
+            toggle(ui, &mut self.cfg.auto_check_updates, "automatically check GitHub for updates when dashboard opens");
 
             let busy = self.upd_busy || self.upd_installing;
             let btn_label = if self.upd_busy {

@@ -85,7 +85,27 @@ impl Shared {
     }
 
     pub fn print(&self, data: Vec<u8>) -> Result<(), String> {
-        printer::print_raw(&self.cfg().printer, &data)
+        self.print_as("Slip", data)
+    }
+
+    pub fn print_as(&self, label: &str, data: Vec<u8>) -> Result<(), String> {
+        let printer_name = self.cfg().printer;
+        match printer::print_raw(&printer_name, &data) {
+            Ok(()) => {
+                record_history(label, &data);
+                Ok(())
+            }
+            Err(e) => {
+                if !printer::list_printers().iter().any(|p| p == &printer_name)
+                    || e.contains("Can't open printer")
+                {
+                    enqueue_print(label, &data);
+                    Err(format!("Printer offline — queued \"{label}\" to print when back online."))
+                } else {
+                    Err(e)
+                }
+            }
+        }
     }
 
     pub fn mark_tested(&self) {
@@ -264,8 +284,66 @@ where
     });
 }
 
-/// Build an ESC/POS slip for a right-clicked file (image or UTF-8/plain text).
+fn parse_url_shortcut(text: &str) -> Option<String> {
+    text.lines()
+        .map(str::trim)
+        .find_map(|line| {
+            let (k, v) = line.split_once('=')?;
+            if k.trim().eq_ignore_ascii_case("URL") && !v.trim().is_empty() {
+                Some(v.trim().to_string())
+            } else {
+                None
+            }
+        })
+}
+
+fn format_delimited_table(text: &str, sep: char) -> String {
+    let mut out = Vec::new();
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    let cap = 60usize;
+    for line in lines.iter().take(cap) {
+        let cols: Vec<&str> = line.split(sep).map(|c| c.trim().trim_matches('"')).collect();
+        out.push(cols.join(" | "));
+    }
+    if lines.len() > cap {
+        out.push(format!("... ({} more rows)", lines.len() - cap));
+    }
+    out.join("\n")
+}
+
+/// Build an ESC/POS slip for a right-clicked file or folder (image, .url QR, .ics agenda, .csv, or text).
 pub fn build_file_slip(cfg: &Config, path: &std::path::Path) -> Result<Vec<u8>, String> {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.display().to_string());
+    let opts = TextOpts { bold: false, big: false, center: false, stamp: true, checklist: false };
+
+    if path.is_dir() {
+        let mut entries: Vec<String> = std::fs::read_dir(path)
+            .map_err(|e| format!("can't open folder {}: {e}", path.display()))?
+            .filter_map(|e| e.ok())
+            .map(|e| {
+                let mut s = e.file_name().to_string_lossy().to_string();
+                if e.file_type().map_or(false, |t| t.is_dir()) {
+                    s.push('/');
+                }
+                s
+            })
+            .collect();
+        entries.sort_by_key(|s| s.to_ascii_lowercase());
+        if entries.is_empty() {
+            return Err("That folder is empty.".into());
+        }
+        let total = entries.len();
+        let cap = 80usize;
+        let mut body = entries.into_iter().take(cap).collect::<Vec<_>>().join("\n");
+        if total > cap {
+            body.push_str(&format!("\n... ({} more items)", total - cap));
+        }
+        return Ok(escpos::titled_text_slip(cfg, Some(&format!("{name}/ ({total})")), &body, &opts));
+    }
+
     let ext = path
         .extension()
         .map(|e| e.to_string_lossy().to_ascii_lowercase())
@@ -273,35 +351,148 @@ pub fn build_file_slip(cfg: &Config, path: &std::path::Path) -> Result<Vec<u8>, 
     if ["png", "jpg", "jpeg", "bmp", "gif", "webp"].contains(&ext.as_str()) {
         let dots = (cfg.paper_chars.max(16) as u32) * 12;
         let bm = crate::raster::from_file(&path.to_string_lossy(), dots, 0.0, true)?;
-        let caption = path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_default();
-        return Ok(escpos::image_slip(cfg, &bm, &caption));
+        return Ok(escpos::image_slip(cfg, &bm, &name));
     }
 
     let meta = std::fs::metadata(path).map_err(|e| format!("can't open {}: {e}", path.display()))?;
     if !meta.is_file() {
-        return Err("Only files can be printed with Thermo Print.".into());
+        return Err("Only files or folders can be printed with Thermo Print.".into());
     }
-    if meta.len() > 256 * 1024 {
-        return Err("File is too large for receipt paper (max 256 KB).".into());
+
+    // Read at most 128 KB so large logs/files truncate gracefully instead of overflowing paper.
+    use std::io::Read;
+    let f = std::fs::File::open(path).map_err(|e| format!("can't read {}: {e}", path.display()))?;
+    let mut bytes = Vec::new();
+    f.take(128 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("can't read {}: {e}", path.display()))?;
+    let byte_truncated = bytes.len() > 128 * 1024;
+    if byte_truncated {
+        bytes.truncate(128 * 1024);
     }
-    let bytes = std::fs::read(path).map_err(|e| format!("can't read {}: {e}", path.display()))?;
+
     if bytes.contains(&0) {
-        return Err("That looks like a binary file. Choose a text file or an image (png/jpg/gif/webp/bmp).".into());
+        return Err("That looks like a binary file. Choose a text file, folder, link (.url), calendar (.ics), or image.".into());
     }
-    let text = String::from_utf8_lossy(&bytes);
-    if text.trim().is_empty() {
+    let raw_text = String::from_utf8_lossy(&bytes);
+    if raw_text.trim().is_empty() {
         return Err("That file is empty.".into());
     }
-    let opts = TextOpts { bold: false, big: false, center: false, stamp: true, checklist: false };
-    Ok(escpos::text_slip(cfg, &text, &opts))
+
+    if ext == "url" {
+        if let Some(url) = parse_url_shortcut(&raw_text) {
+            let heading = name.strip_suffix(".url").or(Some(&name)).unwrap_or("LINK");
+            return escpos::qr_slip(cfg, heading, &url, &[url.clone()]);
+        }
+    }
+
+    if ext == "ics" {
+        let now = Local::now();
+        let events = crate::ical::parse(&raw_text, now - chrono::Duration::days(1), now + chrono::Duration::days(30));
+        return Ok(escpos::agenda(cfg, &events));
+    }
+
+    if ext == "csv" || ext == "tsv" {
+        let sep = if ext == "tsv" { '\t' } else { ',' };
+        let body = format_delimited_table(&raw_text, sep);
+        return Ok(escpos::titled_text_slip(cfg, Some(&name), &body, &opts));
+    }
+
+    let lines: Vec<&str> = raw_text.lines().collect();
+    let line_cap = 120usize;
+    let mut body = lines.iter().take(line_cap).copied().collect::<Vec<_>>().join("\n");
+    if lines.len() > line_cap {
+        body.push_str(&format!("\n... ({} more lines)", lines.len() - line_cap));
+    } else if byte_truncated {
+        body.push_str("\n... (truncated at 128 KB)");
+    }
+
+    let has_checks = (ext == "md" || ext == "txt")
+        && lines.iter().take(30).any(|l| {
+            let t = l.trim_start();
+            t.starts_with("- [ ]") || t.starts_with("- [x]") || t.starts_with("- [X]")
+        });
+    let file_opts = TextOpts { checklist: has_checks, ..opts };
+    Ok(escpos::titled_text_slip(cfg, Some(&name), &body, &file_opts))
 }
 
-pub fn print_file(cfg: &Config, path: &std::path::Path) -> Result<(), String> {
+pub fn record_history(label: &str, data: &[u8]) {
+    if data.is_empty() || data.len() > 64 * 1024 {
+        return;
+    }
+    let time = Local::now().format("%H:%M").to_string();
+    let hex = data::hex_encode(data);
+    data::update(|d| {
+        let id = d.new_id();
+        d.print_history.insert(0, data::PrintJob { id, label: label.to_string(), time, hex });
+        d.print_history.truncate(8);
+    });
+}
+
+pub fn enqueue_print(label: &str, data: &[u8]) {
+    if data.is_empty() || data.len() > 256 * 1024 {
+        return;
+    }
+    let time = Local::now().format("%H:%M").to_string();
+    let hex = data::hex_encode(data);
+    data::update(|d| {
+        let id = d.new_id();
+        d.print_queue.push(data::PrintJob { id, label: label.to_string(), time, hex });
+        if d.print_queue.len() > 20 {
+            let excess = d.print_queue.len() - 20;
+            d.print_queue.drain(..excess);
+        }
+    });
+}
+
+pub fn flush_print_queue(sh: &Shared) -> Result<usize, String> {
+    let cfg = sh.cfg();
+    let queue = data::load().print_queue;
+    if queue.is_empty() {
+        return Ok(0);
+    }
+    if !printer::list_printers().iter().any(|p| p == &cfg.printer) {
+        return Ok(0);
+    }
+    let mut printed = 0usize;
+    for job in queue {
+        let Some(bytes) = data::hex_decode(&job.hex) else {
+            data::update(|d| d.print_queue.retain(|x| x.id != job.id));
+            continue;
+        };
+        printer::print_raw(&cfg.printer, &bytes)?;
+        record_history(&job.label, &bytes);
+        data::update(|d| d.print_queue.retain(|x| x.id != job.id));
+        printed += 1;
+    }
+    Ok(printed)
+}
+
+/// Returns `Ok(true)` if printed immediately, `Ok(false)` if queued while printer is offline.
+pub fn print_file(cfg: &Config, path: &std::path::Path) -> Result<bool, String> {
     let slip = build_file_slip(cfg, path)?;
-    printer::print_raw(&cfg.printer, &slip)
+    let label = format!(
+        "File: {}",
+        path.file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.display().to_string())
+    );
+    match printer::print_raw(&cfg.printer, &slip) {
+        Ok(()) => {
+            record_history(&label, &slip);
+            Ok(true)
+        }
+        Err(e) => {
+            if !printer::list_printers().iter().any(|p| p == &cfg.printer)
+                || e.contains("Can't open printer")
+            {
+                enqueue_print(&label, &slip);
+                Ok(false)
+            } else {
+                Err(e)
+            }
+        }
+    }
 }
 
 /// Global hotkey: copy what is selected (or fall back to the clipboard) and print it.
@@ -330,7 +521,7 @@ pub fn hotkey_print(sh: &Shared) -> Result<&'static str, String> {
         .filter(|t| !t.trim().is_empty())
         .ok_or("nothing selected and the clipboard is empty")?;
     let opts = TextOpts { bold: false, big: false, center: false, stamp: true, checklist: false };
-    sh.print(escpos::text_slip(&cfg, &text, &opts))?;
+    sh.print_as("Selection", escpos::text_slip(&cfg, &text, &opts))?;
     Ok("Printed your selection")
 }
 
@@ -563,10 +754,15 @@ fn tick(sh: &Arc<Shared>, notify: &Notify, st: &mut Sched) {
         }
     }
 
-    // ---- PC alerts
+    // ---- PC alerts & offline print queue
     if st.last_sys.elapsed() >= Duration::from_secs(10) {
         st.last_sys = Instant::now();
         check_alerts(sh, notify, st, &cfg);
+        if let Ok(n) = flush_print_queue(sh) {
+            if n > 0 {
+                say(sh, notify, format!("Printed {n} queued slip(s)"));
+            }
+        }
     }
     if !cfg.watch_urls.is_empty() && st.last_url.map_or(true, |t| t.elapsed() > Duration::from_secs(600)) {
         st.last_url = Some(Instant::now());
@@ -746,19 +942,38 @@ mod tests {
     use super::*;
 
     #[test]
-    fn builds_text_and_rejects_binary_file_slips() {
+    fn builds_text_url_csv_md_dir_and_rejects_binary_file_slips() {
         let cfg = Config::default();
-        let dir = std::env::temp_dir();
-        let txt_path = dir.join("thermo_test_print_file.txt");
-        let bin_path = dir.join("thermo_test_print_file.bin");
+        let dir = std::env::temp_dir().join("thermo_test_files");
+        let _ = std::fs::create_dir_all(&dir);
+        let txt_path = dir.join("note.txt");
+        let md_path = dir.join("tasks.md");
+        let url_path = dir.join("site.url");
+        let csv_path = dir.join("table.csv");
+        let bin_path = dir.join("raw.bin");
 
         std::fs::write(&txt_path, "hello from right-click!").unwrap();
-        let slip = build_file_slip(&cfg, &txt_path).unwrap();
-        assert!(slip.len() > 20);
-        let _ = std::fs::remove_file(&txt_path);
+        assert!(build_file_slip(&cfg, &txt_path).unwrap().len() > 20);
+
+        std::fs::write(&md_path, "- [ ] buy milk\n- [x] print").unwrap();
+        let md_slip = build_file_slip(&cfg, &md_path).unwrap();
+        assert!(md_slip.windows(3).any(|w| w == b"[x]"));
+
+        std::fs::write(&url_path, "[InternetShortcut]\nURL=https://miketsak.gr\n").unwrap();
+        assert!(build_file_slip(&cfg, &url_path).unwrap().len() > 40);
+
+        std::fs::write(&csv_path, "name,qty\ncoffee,2\n").unwrap();
+        let csv_slip = build_file_slip(&cfg, &csv_path).unwrap();
+        assert!(csv_slip.windows(12).any(|w| w == b"coffee | 2\n") || csv_slip.windows(10).any(|w| w == b"coffee | 2"));
+
+        assert!(build_file_slip(&cfg, &dir).unwrap().len() > 20);
 
         std::fs::write(&bin_path, b"\x00\x01\x02\x03").unwrap();
         assert!(build_file_slip(&cfg, &bin_path).is_err());
-        let _ = std::fs::remove_file(&bin_path);
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let raw = b"\x1b@\x00\xffhi";
+        let hex = data::hex_encode(raw);
+        assert_eq!(data::hex_decode(&hex).as_deref(), Some(raw.as_slice()));
     }
 }

@@ -5,8 +5,36 @@ use std::ptr::null_mut;
 use winapi::ctypes::c_void;
 use winapi::shared::minwindef::DWORD;
 use winapi::um::errhandlingapi::GetLastError;
+use winapi::um::handleapi::CloseHandle;
+use winapi::um::synchapi::{CreateMutexW, ReleaseMutex, WaitForSingleObject};
 use winapi::um::winnt::HANDLE;
 use winapi::um::winspool::*;
+
+struct PrintLock(HANDLE);
+
+impl PrintLock {
+    fn acquire() -> Self {
+        let name = wide("ThermoCompanionPrintLock");
+        unsafe {
+            let h = CreateMutexW(null_mut(), 0, name.as_ptr());
+            if !h.is_null() {
+                WaitForSingleObject(h, 15_000);
+            }
+            PrintLock(h)
+        }
+    }
+}
+
+impl Drop for PrintLock {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.0.is_null() {
+                ReleaseMutex(self.0);
+                CloseHandle(self.0);
+            }
+        }
+    }
+}
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
@@ -64,8 +92,9 @@ pub fn guess_receipt_printer(names: &[String]) -> Option<String> {
         .cloned()
 }
 
-/// Send raw bytes to the named printer.
+/// Send raw bytes to the named printer (serialized across processes).
 pub fn print_raw(name: &str, data: &[u8]) -> Result<(), String> {
+    let _lock = PrintLock::acquire();
     unsafe {
         let mut wname = wide(name);
         let mut handle: HANDLE = null_mut();

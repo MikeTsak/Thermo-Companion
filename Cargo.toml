@@ -1,6 +1,6 @@
 [package]
 name = "thermo-companion"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 description = "Thermo Companion: Pip, a tiny desk buddy that prints your calendar, tasks, alerts and more on an ESC/POS receipt printer (Windows) — made by miketsak.gr"
 authors = ["miketsak.gr"]
@@ -26,6 +26,9 @@ ureq = { version = "2.10", default-features = false, features = ["native-tls", "
 native-tls = "0.2"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "gif", "webp"] }
 qrcode = { version = "0.14", default-features = false }
+
+[build-dependencies]
+embed-manifest = "1.4"
 
 [profile.release]
 opt-level = "z"

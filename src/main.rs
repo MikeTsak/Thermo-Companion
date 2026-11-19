@@ -379,21 +379,25 @@ fn show_error_box(msg: &str) {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
-    // `thermo-companion.exe --print-file <path>`: print a right-clicked image or text file and exit.
+    // `thermo-companion.exe --print-file <path>...`: print right-clicked image, folder, or text files and exit.
     if let Some(pos) = args.iter().position(|a| a == "--print-file") {
-        let Some(file_arg) = args.get(pos + 1) else {
+        let files = &args[pos + 1..];
+        if files.is_empty() {
             std::process::exit(1);
-        };
+        }
         let (cfg, _) = config::load();
-        let path = std::path::Path::new(file_arg);
-        let result = app::print_file(&cfg, path);
-        config::log(&match &result {
-            Ok(()) => format!("right-click printed \"{}\"", path.display()),
-            Err(e) => format!("right-click print failed for \"{}\": {e}", path.display()),
-        });
-        if let Err(e) = result {
-            show_error_box(&e);
-            std::process::exit(1);
+        for file_arg in files {
+            let path = std::path::Path::new(file_arg);
+            let result = app::print_file(&cfg, path);
+            config::log(&match &result {
+                Ok(true) => format!("right-click printed \"{}\"", path.display()),
+                Ok(false) => format!("right-click queued (printer offline) \"{}\"", path.display()),
+                Err(e) => format!("right-click print failed for \"{}\": {e}", path.display()),
+            });
+            if let Err(e) = result {
+                show_error_box(&e);
+                std::process::exit(1);
+            }
         }
         return;
     }
