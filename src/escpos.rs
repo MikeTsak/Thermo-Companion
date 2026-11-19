@@ -1052,7 +1052,16 @@ mod tests {
         let todos = vec![Todo { id: 1, text: "write code".into(), done: false }];
         let habit = Habit { id: 1, name: "Read".into(), days: vec![] };
         let today = Local::now().date_naive();
-        assert!(briefing(&cfg, &[], None, &todos, "hi").len() > 20);
+        assert!(briefing(&cfg, &[], None, &todos, &[("Trip".into(), 7)], "hi").len() > 20);
+        let note = Note { id: 1, title: "Groceries".into(), checklist: true, items: vec![crate::data::NoteItem { text: "milk".into(), done: false }], ..Default::default() };
+        assert!(note_slip(&cfg, &note).len() > 20);
+        assert!(event_ticket(&cfg, "Concert", "Fri 20:00", "Odeon", "A12", "10 EUR").len() > 40);
+        assert!(boarding_pass(&cfg, "ATHENS", "CAIRO", "26 Nov", "A3 123", "12A", "Pip").len() > 40);
+        assert!(big_label(&cfg, "FRAGILE", 3, 2).len() > 40);
+        assert!(week_planner(&cfg, today, &[], &todos).len() > 40);
+        assert!(countdown_slip(&cfg, &[("Trip".into(), 3)]).len() > 20);
+        assert!(fortune_slip(&cfg, "FORTUNE", "You will print.", true).len() > 20);
+        assert!(decide_slip(&cfg, "Pizza?", "YES").len() > 20);
         assert!(todo_list(&cfg, &todos).len() > 20);
         assert!(habit_card(&cfg, &habit, today, 0).len() > 20);
         assert!(reminder(&cfg, "stand up").len() > 20);

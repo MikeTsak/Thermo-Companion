@@ -9,7 +9,7 @@ use crate::net;
 use crate::pip::{self, Mood};
 use crate::printer;
 use crate::sysinfo;
-use chrono::{DateTime, Local, Timelike};
+use chrono::{DateTime, Datelike, Local, Timelike};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -79,8 +79,9 @@ impl Shared {
         std::mem::take(&mut *self.messages.lock().unwrap())
     }
 
+    /// A calendar is linked (iCal link or Google sign-in).
     pub fn connected(&self) -> bool {
-        !self.cfg().google_refresh_token.is_empty()
+        self.cfg().calendar_linked()
     }
 
     pub fn print(&self, data: Vec<u8>) -> Result<(), String> {
@@ -89,10 +90,13 @@ impl Shared {
 
     pub fn refresh_events(&self) -> Result<(), String> {
         let cfg = self.cfg();
-        if cfg.google_refresh_token.is_empty() {
-            return Err("Google Calendar isn't connected yet (Settings > Connect Google).".into());
-        }
-        let events = gcal::fetch(&cfg, 14)?;
+        let events = if !cfg.ical_url.trim().is_empty() {
+            crate::ical::fetch(&cfg.ical_url, 14)?
+        } else if !cfg.google_refresh_token.is_empty() {
+            gcal::fetch(&cfg, 14)?
+        } else {
+            return Err("No calendar is linked yet (Settings > Calendar).".into());
+        };
         *self.events.lock().unwrap() = events;
         *self.last_fetch.lock().unwrap() = Some(Instant::now());
         Ok(())
@@ -161,9 +165,34 @@ impl Shared {
             Vec::new()
         };
         let weather = self.weather(&cfg);
-        let todos = data::load().todos;
+        let d = data::load();
         let quote = pip::slip_line(Local::now().timestamp() as u64 / 86400);
-        self.print(escpos::briefing(&cfg, &events, weather.as_ref(), &todos, quote))
+        let counts: Vec<(String, i64)> = countdown_list(&d).into_iter().filter(|c| c.1 >= 0).take(3).collect();
+        self.print(escpos::briefing(&cfg, &events, weather.as_ref(), &d.todos, &counts, quote))
+    }
+
+    /// The week (Monday first) that is `offset` weeks from this one.
+    pub fn print_planner(&self, offset: i64) -> Result<(), String> {
+        if self.connected() {
+            let _ = self.ensure_events(true);
+        }
+        let today = Local::now().date_naive();
+        let monday = today - chrono::Duration::days(today.weekday().num_days_from_monday() as i64)
+            + chrono::Duration::days(7 * offset);
+        let end = monday + chrono::Duration::days(7);
+        let events: Vec<Event> = self
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| e.start.date_naive() >= monday && e.start.date_naive() < end)
+            .cloned()
+            .collect();
+        self.print(escpos::week_planner(&self.cfg(), monday, &events, &data::load().todos))
+    }
+
+    pub fn print_countdowns(&self) -> Result<(), String> {
+        self.print(escpos::countdown_slip(&self.cfg(), &countdown_list(&data::load())))
     }
 
     pub fn print_end_of_day(&self) -> Result<(), String> {
@@ -192,6 +221,21 @@ impl Shared {
     pub fn print_alert(&self, title: &str, body: &str, mood: Mood) -> Result<(), String> {
         self.print(escpos::alert(&self.cfg(), title, body, mood))
     }
+}
+
+/// Countdowns as (name, days left), nearest first.
+pub fn countdown_list(d: &data::Data) -> Vec<(String, i64)> {
+    let today = Local::now().date_naive();
+    let mut v: Vec<(String, i64)> = d
+        .countdowns
+        .iter()
+        .filter_map(|c| {
+            let date = chrono::NaiveDate::parse_from_str(&c.date, "%Y-%m-%d").ok()?;
+            Some((c.name.clone(), (date - today).num_days()))
+        })
+        .collect();
+    v.sort_by_key(|x| (x.1 < 0, x.1.abs()));
+    v
 }
 
 /// Run `job` on a worker thread, then show `ok` (or the error) and ping `notify`.
@@ -294,7 +338,7 @@ fn tick(sh: &Arc<Shared>, notify: &Notify, st: &mut Sched) {
     let after = |h: u32, m: u32| (now.hour(), now.minute()) >= (h, m);
 
     // ---- calendar
-    if !cfg.google_refresh_token.is_empty() {
+    if cfg.calendar_linked() {
         let stale = sh
             .last_fetch
             .lock()
@@ -378,7 +422,24 @@ fn tick(sh: &Arc<Shared>, notify: &Notify, st: &mut Sched) {
         }
         data::update(|d| {
             if let Some(r) = d.reminders.iter_mut().find(|r| r.id == id) {
-                r.fired = true;
+                match r.repeat.as_str() {
+                    "daily" | "weekdays" | "weekly" => {
+                        // schedule the next one (skipping weekends for "weekdays")
+                        if let Some(mut due) = parse_time(&r.due) {
+                            loop {
+                                due += chrono::Duration::days(if r.repeat == "weekly" { 7 } else { 1 });
+                                let weekend = matches!(due.weekday(), chrono::Weekday::Sat | chrono::Weekday::Sun);
+                                if due > now && !(r.repeat == "weekdays" && weekend) {
+                                    break;
+                                }
+                            }
+                            r.due = due.to_rfc3339();
+                        } else {
+                            r.fired = true;
+                        }
+                    }
+                    _ => r.fired = true,
+                }
             }
             // forget reminders that fired more than a day ago
             let cutoff = now - chrono::Duration::days(1);

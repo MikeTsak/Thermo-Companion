@@ -3,11 +3,11 @@
 
 use crate::app::{self, Notify, Shared};
 use crate::config::{self, Config};
-use crate::data::{self, Data};
+use crate::data::{self, Data, Note, NoteItem};
 use crate::escpos::{self, TextOpts};
 use crate::pip::{self, Mood};
-use crate::{autostart, gcal, printer, raster};
-use chrono::{Local, Timelike};
+use crate::{autostart, gcal, ical, printer, raster, sysinfo};
+use chrono::{Datelike, Local, TimeZone, Timelike};
 use eframe::egui::{self, Color32, CornerRadius, FontFamily, FontId, Margin, RichText, Stroke, TextStyle, Ui};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
@@ -30,9 +30,22 @@ const DIM: Color32 = Color32::from_rgb(130, 146, 170);
 const TEXT: Color32 = Color32::from_rgb(222, 230, 242);
 const INK: Color32 = Color32::from_rgb(14, 18, 26);
 
+/// Keep-style note colours (dark tints).
+const NOTE_COLORS: [(&str, Color32); 8] = [
+    ("plain", CARD),
+    ("red", Color32::from_rgb(84, 40, 46)),
+    ("orange", Color32::from_rgb(86, 56, 26)),
+    ("yellow", Color32::from_rgb(80, 72, 26)),
+    ("green", Color32::from_rgb(30, 72, 48)),
+    ("teal", Color32::from_rgb(26, 68, 74)),
+    ("blue", Color32::from_rgb(34, 56, 96)),
+    ("purple", Color32::from_rgb(64, 44, 96)),
+];
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Page {
     Home,
+    Notes,
     Print,
     Schedule,
     Tasks,
@@ -40,30 +53,96 @@ enum Page {
     Settings,
 }
 
-impl Page {
-    const ALL: [Page; 6] = [Page::Home, Page::Print, Page::Schedule, Page::Tasks, Page::Alerts, Page::Settings];
+const PRINT_TABS: [&str; 7] = ["text", "picture", "qr + wifi", "tickets", "labels", "stickers", "fun"];
+const SCHED_TABS: [&str; 7] = ["calendar", "agenda", "briefing", "reminders", "focus", "end of day", "planner"];
+const TASK_TABS: [&str; 3] = ["to-do", "habits", "countdowns"];
+const ALERT_TABS: [&str; 5] = ["downloads", "battery + disk", "programs", "web pages", "mail"];
+const SET_TABS: [&str; 4] = ["printer", "system", "calendar", "about"];
 
-    fn path(self) -> &'static str {
+impl Page {
+    const ALL: [Page; 7] = [
+        Page::Home,
+        Page::Notes,
+        Page::Print,
+        Page::Schedule,
+        Page::Tasks,
+        Page::Alerts,
+        Page::Settings,
+    ];
+
+    fn idx(self) -> usize {
+        Page::ALL.iter().position(|p| *p == self).unwrap_or(0)
+    }
+
+    fn name(self) -> &'static str {
         match self {
-            Page::Home => "~/home",
-            Page::Print => "~/print",
-            Page::Schedule => "~/schedule",
-            Page::Tasks => "~/tasks",
-            Page::Alerts => "~/alerts",
-            Page::Settings => "~/settings",
+            Page::Home => "home",
+            Page::Notes => "notes",
+            Page::Print => "print",
+            Page::Schedule => "schedule",
+            Page::Tasks => "tasks",
+            Page::Alerts => "alerts",
+            Page::Settings => "settings",
+        }
+    }
+
+    fn tabs(self) -> &'static [&'static str] {
+        match self {
+            Page::Print => &PRINT_TABS,
+            Page::Schedule => &SCHED_TABS,
+            Page::Tasks => &TASK_TABS,
+            Page::Alerts => &ALERT_TABS,
+            Page::Settings => &SET_TABS,
+            _ => &[],
         }
     }
 
     fn from_arg(s: &str) -> Page {
-        match s {
-            "print" => Page::Print,
-            "schedule" => Page::Schedule,
-            "tasks" => Page::Tasks,
-            "alerts" => Page::Alerts,
-            "settings" => Page::Settings,
-            _ => Page::Home,
+        Page::ALL.iter().copied().find(|p| p.name() == s).unwrap_or(Page::Home)
+    }
+}
+
+/// Things the command palette (Ctrl+K) can do.
+#[derive(Clone, Copy)]
+enum Cmd {
+    Go(Page, usize),
+    PrintAgenda,
+    Briefing,
+    EndOfDay,
+    Todos,
+    TestSlip,
+    ToggleFocus,
+    NewNote,
+    Fortune,
+    Joke,
+    Coin,
+    Planner,
+    Countdowns,
+    ConnectCalendar,
+}
+
+fn all_commands() -> Vec<(String, Cmd)> {
+    let mut v: Vec<(String, Cmd)> = Vec::new();
+    v.push(("new note".into(), Cmd::NewNote));
+    v.push(("print today's agenda".into(), Cmd::PrintAgenda));
+    v.push(("print morning briefing".into(), Cmd::Briefing));
+    v.push(("print end-of-day receipt".into(), Cmd::EndOfDay));
+    v.push(("print to-do list".into(), Cmd::Todos));
+    v.push(("print week planner".into(), Cmd::Planner));
+    v.push(("print countdowns".into(), Cmd::Countdowns));
+    v.push(("print test slip".into(), Cmd::TestSlip));
+    v.push(("start / stop focus timer".into(), Cmd::ToggleFocus));
+    v.push(("print a fortune cookie".into(), Cmd::Fortune));
+    v.push(("print a joke".into(), Cmd::Joke));
+    v.push(("flip a coin".into(), Cmd::Coin));
+    v.push(("connect calendar (google link)".into(), Cmd::ConnectCalendar));
+    for p in Page::ALL {
+        v.push((format!("go to {}", p.name()), Cmd::Go(p, 0)));
+        for (i, t) in p.tabs().iter().enumerate() {
+            v.push((format!("go to {} / {}", p.name(), t), Cmd::Go(p, i)));
         }
     }
+    v
 }
 
 struct Textures {
@@ -144,6 +223,10 @@ fn mono(text: &str, color: Color32) -> RichText {
     RichText::new(text).monospace().color(color)
 }
 
+fn lighten(c: Color32) -> Color32 {
+    Color32::from_rgb(c.r().saturating_add(34), c.g().saturating_add(34), c.b().saturating_add(34))
+}
+
 fn card(ui: &mut Ui, add: impl FnOnce(&mut Ui)) {
     // the frame's margins and stroke come on top of the width we ask for
     let inner = (ui.available_width() - 34.0).max(100.0);
@@ -172,7 +255,25 @@ fn section(ui: &mut Ui, tag: &str, title: &str, add: impl FnOnce(&mut Ui)) {
 fn page_title(ui: &mut Ui, path: &str, sub: &str) {
     ui.label(RichText::new(format!("$ cd {path}")).monospace().size(24.0).color(AMBER));
     ui.label(mono(sub, DIM));
-    ui.add_space(6.0);
+    ui.add_space(4.0);
+}
+
+fn tab_bar(ui: &mut Ui, current: &mut usize, labels: &[&str]) {
+    ui.horizontal_wrapped(|ui| {
+        for (i, l) in labels.iter().enumerate() {
+            let active = *current == i;
+            let resp = ui.add(
+                egui::Button::new(RichText::new(*l).monospace().color(if active { AMBER } else { DIM }))
+                    .fill(if active { CARD2 } else { Color32::TRANSPARENT })
+                    .stroke(Stroke::new(1.0, if active { AMBER } else { BORDER }))
+                    .corner_radius(CornerRadius::same(20)),
+            );
+            if resp.clicked() {
+                *current = i;
+            }
+        }
+    });
+    ui.add_space(4.0);
 }
 
 fn action(ui: &mut Ui, text: &str, color: Color32) -> egui::Response {
@@ -185,6 +286,10 @@ fn action(ui: &mut Ui, text: &str, color: Color32) -> egui::Response {
 
 fn ghost(ui: &mut Ui, text: &str) -> egui::Response {
     ui.add(egui::Button::new(RichText::new(text).monospace()))
+}
+
+fn small_btn(ui: &mut Ui, text: &str) -> egui::Response {
+    ui.add(egui::Button::new(RichText::new(text).monospace().size(12.5)).small())
 }
 
 fn toggle(ui: &mut Ui, on: &mut bool, label: &str) {
@@ -212,6 +317,24 @@ fn pill(ui: &mut Ui, text: &str, color: Color32) {
         });
 }
 
+fn swatches(ui: &mut Ui, sel: &mut u8) {
+    ui.horizontal(|ui| {
+        for (i, (name, c)) in NOTE_COLORS.iter().enumerate() {
+            let selected = *sel as usize == i;
+            let resp = ui.add(
+                egui::Button::new("")
+                    .fill(*c)
+                    .stroke(Stroke::new(if selected { 2.0 } else { 1.0 }, if selected { AMBER } else { lighten(*c) }))
+                    .corner_radius(CornerRadius::same(12))
+                    .min_size(egui::vec2(24.0, 24.0)),
+            );
+            if resp.on_hover_text(*name).clicked() {
+                *sel = i as u8;
+            }
+        }
+    });
+}
+
 fn wifi_escape(s: &str) -> String {
     let mut out = String::new();
     for c in s.chars() {
@@ -228,12 +351,26 @@ fn fmt_countdown(secs: i64) -> String {
     format!("{:02}:{:02}", s / 60, s % 60)
 }
 
+fn open_url(url: &str) {
+    let _ = std::process::Command::new("rundll32").args(["url.dll,FileProtocolHandler", url]).spawn();
+}
+
+/// client_id and client_secret from Google's downloaded JSON (or a path to that file).
+fn parse_client(text: &str) -> Option<(String, String)> {
+    let text = text.trim().trim_matches('"');
+    let json = if text.starts_with('{') { text.to_string() } else { std::fs::read_to_string(text).ok()? };
+    let v: serde_json::Value = serde_json::from_str(&json).ok()?;
+    let c = if v.get("installed").is_some() { &v["installed"] } else { &v["web"] };
+    Some((c["client_id"].as_str()?.to_string(), c["client_secret"].as_str()?.to_string()))
+}
+
 // -------------------------------------------------------------------- app
 
 struct Dash {
     sh: Arc<Shared>,
     notify: Notify,
     page: Page,
+    tabs: [usize; 7],
     tex: Textures,
     cfg: Config,
     data: Data,
@@ -245,7 +382,39 @@ struct Dash {
     just_done: Option<Instant>,
     started: Instant,
 
-    // print page
+    // command palette
+    pal_open: bool,
+    pal_query: String,
+    pal_sel: usize,
+    pal_focus: bool,
+
+    // connect calendar popup
+    connect_open: bool,
+    connect_tab: usize,
+    ical_input: String,
+    ical_busy: bool,
+    ical_note: String,
+    ical_slot: Arc<Mutex<Option<Result<(String, usize), String>>>>,
+    google: Arc<Mutex<Option<Result<String, String>>>>,
+    google_busy: bool,
+    connect_mail: bool,
+    client_note: String,
+
+    // notes
+    n_title: String,
+    n_body: String,
+    n_check: bool,
+    n_color: u8,
+    n_labels: String,
+    n_focus: bool,
+    n_search: String,
+    n_filter: Option<String>,
+    n_archived: bool,
+    editing: Option<u64>,
+    edit_title: String,
+    edit_body: String,
+
+    // print
     txt: String,
     t_bold: bool,
     t_big: bool,
@@ -263,20 +432,31 @@ struct Dash {
     wifi_pass: String,
     wifi_open: bool,
     sticker: usize,
+    tk_kind: usize,
+    tk: [String; 6],
+    lb_text: String,
+    lb_scale: u8,
+    lb_copies: u8,
+    fun_kind: u8,
+    fun_title: String,
+    fun_text: String,
+    fun_question: String,
+    fun_list: String,
 
     // schedule / tasks / alerts
     new_reminder: String,
-    reminder_min: u32,
+    rem_at: bool,
+    rem_min: u32,
+    rem_h: u32,
+    rem_m: u32,
+    rem_repeat: usize,
     pomo_task: String,
     new_todo: String,
     new_habit: String,
+    cd_name: String,
+    cd_date: [i32; 3],
     new_url: String,
     new_proc: String,
-
-    // google
-    google: Arc<Mutex<Option<Result<String, String>>>>,
-    google_busy: bool,
-    connect_mail: bool,
 }
 
 const STICKERS: [(&str, Mood); 5] = [
@@ -287,8 +467,10 @@ const STICKERS: [(&str, Mood); 5] = [
     ("sad", Mood::Sad),
 ];
 
+const REPEATS: [(&str, &str); 4] = [("once", ""), ("daily", "daily"), ("weekdays", "weekdays"), ("weekly", "weekly")];
+
 impl Dash {
-    fn new(cc: &eframe::CreationContext<'_>, shared: Arc<Shared>, page: Option<String>) -> Dash {
+    fn new(cc: &eframe::CreationContext<'_>, shared: Arc<Shared>, arg: Option<String>) -> Dash {
         let ctx = cc.egui_ctx.clone();
         apply_theme(&ctx);
         let tex = Textures {
@@ -305,14 +487,30 @@ impl Dash {
         let cfg = shared.cfg();
 
         // Fetch the calendar in the background so the dashboard has something to show.
-        if !cfg.google_refresh_token.is_empty() {
+        if cfg.calendar_linked() {
             app::spawn_job(&shared, notify.clone(), "Calendar updated", |s| s.refresh_events());
         }
+
+        // launch options: "notes-new", "connect", "palette", or "page" / "page/tab-number"
+        let arg = arg.unwrap_or_default();
+        let (page_name, tab_no) = match arg.split_once('/') {
+            Some((p, t)) => (p.to_string(), t.parse::<usize>().unwrap_or(0)),
+            None => (arg.clone(), 0),
+        };
+        let (page, n_focus) = match page_name.as_str() {
+            "notes-new" => (Page::Notes, true),
+            other => (Page::from_arg(other), false),
+        };
+        let mut tabs = [0usize; 7];
+        tabs[page.idx()] = tab_no.min(page.tabs().len().saturating_sub(1));
+        let today = Local::now().date_naive() + chrono::Duration::days(30);
+        let now = Local::now() + chrono::Duration::minutes(10);
 
         Dash {
             sh: shared,
             notify,
-            page: page.as_deref().map(Page::from_arg).unwrap_or(Page::Home),
+            page,
+            tabs,
             tex,
             cfg,
             data: data::load(),
@@ -323,6 +521,32 @@ impl Dash {
             status_at: Instant::now(),
             just_done: None,
             started: Instant::now(),
+            pal_open: arg == "palette",
+            pal_query: String::new(),
+            pal_sel: 0,
+            pal_focus: arg == "palette",
+            connect_open: arg == "connect",
+            connect_tab: 0,
+            ical_input: String::new(),
+            ical_busy: false,
+            ical_note: String::new(),
+            ical_slot: Arc::new(Mutex::new(None)),
+            google: Arc::new(Mutex::new(None)),
+            google_busy: false,
+            connect_mail: false,
+            client_note: String::new(),
+            n_title: String::new(),
+            n_body: String::new(),
+            n_check: false,
+            n_color: 0,
+            n_labels: String::new(),
+            n_focus,
+            n_search: String::new(),
+            n_filter: None,
+            n_archived: false,
+            editing: None,
+            edit_title: String::new(),
+            edit_body: String::new(),
             txt: String::new(),
             t_bold: false,
             t_big: false,
@@ -340,16 +564,29 @@ impl Dash {
             wifi_pass: String::new(),
             wifi_open: false,
             sticker: 0,
+            tk_kind: 0,
+            tk: Default::default(),
+            lb_text: String::new(),
+            lb_scale: 3,
+            lb_copies: 1,
+            fun_kind: 0,
+            fun_title: String::new(),
+            fun_text: String::new(),
+            fun_question: String::new(),
+            fun_list: String::new(),
             new_reminder: String::new(),
-            reminder_min: 10,
+            rem_at: false,
+            rem_min: 10,
+            rem_h: now.hour(),
+            rem_m: now.minute(),
+            rem_repeat: 0,
             pomo_task: String::new(),
             new_todo: String::new(),
             new_habit: String::new(),
+            cd_name: String::new(),
+            cd_date: [today.year(), today.month() as i32, today.day() as i32],
             new_url: String::new(),
             new_proc: String::new(),
-            google: Arc::new(Mutex::new(None)),
-            google_busy: false,
-            connect_mail: false,
         }
     }
 
@@ -372,6 +609,15 @@ impl Dash {
     fn change_data(&mut self, f: impl FnOnce(&mut Data)) {
         data::update(f);
         self.refresh_data();
+    }
+
+    fn goto(&mut self, page: Page, tab: usize) {
+        self.page = page;
+        self.tabs[page.idx()] = tab.min(page.tabs().len().saturating_sub(1));
+    }
+
+    fn tab(&self) -> usize {
+        self.tabs[self.page.idx()]
     }
 
     fn paper_dots(&self) -> u32 {
@@ -420,11 +666,32 @@ impl Dash {
             self.printers_at = Instant::now();
         }
         for m in self.sh.take_msgs() {
-            if m.starts_with("Printed") || m.contains("printed") {
+            if m.starts_with("Printed") || m.contains("printed") || m.starts_with("Test slip") {
                 self.just_done = Some(Instant::now());
+            }
+            if m.starts_with("Test slip") && !self.cfg.did_test {
+                self.cfg.did_test = true;
             }
             self.say(m);
         }
+
+        // finished iCal test
+        let ical_done = self.ical_slot.lock().unwrap().take();
+        if let Some(r) = ical_done {
+            self.ical_busy = false;
+            match r {
+                Ok((url, n)) => {
+                    self.cfg.ical_url = url;
+                    self.ical_note = format!("Linked! Found {n} events in the next 2 weeks.");
+                    self.say("Calendar linked. Hi calendar!");
+                    let c = self.cfg.clone();
+                    self.sh.set_cfg(c);
+                    app::spawn_job(&self.sh, self.notify.clone(), "Calendar updated", |s| s.refresh_events());
+                }
+                Err(e) => self.ical_note = format!("That didn't work: {e}"),
+            }
+        }
+
         // finished Google sign-in
         let finished = self.google.lock().unwrap().take();
         if let Some(r) = finished {
@@ -433,27 +700,118 @@ impl Dash {
                 Ok(token) => {
                     self.cfg.google_refresh_token = token;
                     self.cfg.google_has_mail = self.connect_mail;
-                    self.say("Google connected. Hi calendar!");
+                    self.client_note = "Signed in. Hi Google!".into();
+                    self.say("Google connected.");
                     let c = self.cfg.clone();
                     self.sh.set_cfg(c);
                     app::spawn_job(&self.sh, self.notify.clone(), "Calendar updated", |s| s.refresh_events());
                 }
-                Err(e) => self.say(format!("Google sign-in failed: {e}")),
+                Err(e) => self.client_note = format!("Sign-in failed: {e}"),
             }
         }
-        // pictures dropped on the window
+
+        // files dropped on the window: pictures to print, Google's client .json
         let dropped = ctx.input(|i| i.raw.dropped_files.clone());
         for f in dropped {
-            {
-                let p = f.path().to_path_buf();
-                let ext = p.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
-                if ["png", "jpg", "jpeg", "bmp", "gif", "webp"].contains(&ext.as_str()) {
-                    self.img_path = p.to_string_lossy().to_string();
-                    self.page = Page::Print;
-                    self.say("Picture loaded. Check the preview, then print.");
+            let p = f.path().to_path_buf();
+            let ext = p.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+            if ext == "json" {
+                match parse_client(&p.to_string_lossy()) {
+                    Some((id, secret)) => {
+                        self.cfg.google_client_id = id;
+                        self.cfg.google_client_secret = secret;
+                        self.client_note = "Client loaded from the file. Now press sign in.".into();
+                        self.connect_open = true;
+                        self.connect_tab = 1;
+                    }
+                    None => self.say("That .json doesn't look like a Google OAuth client file."),
                 }
+            } else if ["png", "jpg", "jpeg", "bmp", "gif", "webp"].contains(&ext.as_str()) {
+                self.img_path = p.to_string_lossy().to_string();
+                self.goto(Page::Print, 1);
+                self.say("Picture loaded. Check the preview, then print.");
             }
         }
+
+        // keyboard: command palette and page shortcuts
+        let (k, digit) = ctx.input(|i| {
+            let k = i.modifiers.command && i.key_pressed(egui::Key::K);
+            let keys = [
+                egui::Key::Num1,
+                egui::Key::Num2,
+                egui::Key::Num3,
+                egui::Key::Num4,
+                egui::Key::Num5,
+                egui::Key::Num6,
+                egui::Key::Num7,
+            ];
+            let d = if i.modifiers.command {
+                keys.iter().position(|key| i.key_pressed(*key))
+            } else {
+                None
+            };
+            (k, d)
+        });
+        if k {
+            self.pal_open = !self.pal_open;
+            self.pal_query.clear();
+            self.pal_sel = 0;
+            self.pal_focus = true;
+        }
+        if let Some(d) = digit {
+            self.page = Page::ALL[d];
+        }
+    }
+
+    fn run_cmd(&mut self, cmd: Cmd) {
+        match cmd {
+            Cmd::Go(p, t) => self.goto(p, t),
+            Cmd::PrintAgenda => self.job("Printed today's agenda", |s| s.print_agenda(true)),
+            Cmd::Briefing => self.job("Printed your morning briefing", |s| s.print_briefing()),
+            Cmd::EndOfDay => self.job("Printed your end-of-day receipt", |s| s.print_end_of_day()),
+            Cmd::Todos => {
+                let todos = self.data.todos.clone();
+                self.job("Printed your to-do list", move |s| s.print(escpos::todo_list(&s.cfg(), &todos)));
+            }
+            Cmd::TestSlip => self.job("Test slip printed", |s| s.print(escpos::test_slip(&s.cfg()))),
+            Cmd::ToggleFocus => self.toggle_focus(),
+            Cmd::NewNote => {
+                self.goto(Page::Notes, 0);
+                self.n_focus = true;
+            }
+            Cmd::Fortune => self.job("Printed a fortune", |s| {
+                s.print(escpos::fortune_slip(&s.cfg(), "FORTUNE", pip::fortune(), true))
+            }),
+            Cmd::Joke => self.job("Printed a joke", |s| s.print(escpos::fortune_slip(&s.cfg(), "JOKE", pip::joke(), false))),
+            Cmd::Coin => {
+                self.goto(Page::Print, 6);
+                self.flip_coin();
+            }
+            Cmd::Planner => self.job("Printed the week planner", |s| s.print_planner(0)),
+            Cmd::Countdowns => self.job("Printed your countdowns", |s| s.print_countdowns()),
+            Cmd::ConnectCalendar => self.connect_open = true,
+        }
+    }
+
+    fn toggle_focus(&mut self) {
+        let mins = self.cfg.pomo_work;
+        let task = self.pomo_task.trim().to_string();
+        self.change_data(|d| {
+            if d.pomodoro.running {
+                d.pomodoro.running = false;
+            } else {
+                d.pomodoro.running = true;
+                d.pomodoro.phase = "work".into();
+                d.pomodoro.task = task;
+                d.pomodoro.ends_at = (Local::now() + chrono::Duration::minutes(mins as i64)).to_rfc3339();
+            }
+        });
+    }
+
+    fn flip_coin(&mut self) {
+        self.fun_kind = 0;
+        self.fun_title = "coin flip".into();
+        self.fun_text = if pip::rand(2) == 0 { "HEADS" } else { "TAILS" }.into();
     }
 
     // ---------------------------------------------------------------- nav
@@ -466,24 +824,40 @@ impl Dash {
                 ui.label(RichText::new("Companion").strong().size(17.0).color(AMBER));
             });
         });
-        ui.add_space(14.0);
-        for p in Page::ALL {
+        ui.add_space(10.0);
+        let search = ui.add_sized(
+            [ui.available_width(), 32.0],
+            egui::Button::new(RichText::new("search...  ctrl+k").monospace().size(13.0).color(DIM))
+                .fill(Color32::from_rgb(7, 10, 15))
+                .stroke(Stroke::new(1.0, BORDER)),
+        );
+        if search.clicked() {
+            self.pal_open = true;
+            self.pal_query.clear();
+            self.pal_sel = 0;
+            self.pal_focus = true;
+        }
+        ui.add_space(8.0);
+        for (i, p) in Page::ALL.iter().copied().enumerate() {
             let active = self.page == p;
-            let label = if active { format!("> {}", p.path()) } else { format!("  {}", p.path()) };
-            let color = if active { AMBER } else { DIM };
+            let label = if active { format!("> ~/{}", p.name()) } else { format!("  ~/{}", p.name()) };
             let resp = ui.add_sized(
                 [ui.available_width(), 34.0],
-                egui::Button::new(RichText::new(label).monospace().size(15.0).color(color))
+                egui::Button::new(RichText::new(label).monospace().size(15.0).color(if active { AMBER } else { DIM }))
                     .fill(if active { CARD2 } else { Color32::TRANSPARENT })
                     .stroke(Stroke::NONE)
                     .corner_radius(CornerRadius::same(8)),
             );
-            if resp.clicked() {
+            if resp.on_hover_text(format!("ctrl+{}", i + 1)).clicked() {
                 self.page = p;
             }
         }
-        ui.add_space(20.0);
+        ui.add_space(14.0);
         ui.separator();
+        let open = self.data.todos.iter().filter(|t| !t.done).count();
+        ui.label(mono(&format!("{open} tasks open"), DIM));
+        ui.label(mono(&format!("{} notes", self.data.notes.iter().filter(|n| !n.archived).count()), DIM));
+        ui.add_space(4.0);
         ui.label(mono(&format!("v{}", env!("CARGO_PKG_VERSION")), DIM));
         ui.horizontal_wrapped(|ui| {
             pill(ui, "rust", AMBER);
@@ -501,10 +875,268 @@ impl Dash {
         });
     }
 
+    // ------------------------------------------------------ command palette
+
+    fn palette(&mut self, ctx: &egui::Context) {
+        if !self.pal_open {
+            return;
+        }
+        let cmds = all_commands();
+        let q = self.pal_query.to_lowercase();
+        let tokens: Vec<&str> = q.split_whitespace().collect();
+        let matches: Vec<usize> = cmds
+            .iter()
+            .enumerate()
+            .filter(|(_, (label, _))| tokens.iter().all(|t| label.contains(t)))
+            .map(|(i, _)| i)
+            .take(10)
+            .collect();
+        self.pal_sel = self.pal_sel.min(matches.len().saturating_sub(1));
+
+        let (down, up, enter, esc) = ctx.input_mut(|i| {
+            (
+                i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown),
+                i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp),
+                i.consume_key(egui::Modifiers::NONE, egui::Key::Enter),
+                i.consume_key(egui::Modifiers::NONE, egui::Key::Escape),
+            )
+        });
+        if down && self.pal_sel + 1 < matches.len() {
+            self.pal_sel += 1;
+        }
+        if up && self.pal_sel > 0 {
+            self.pal_sel -= 1;
+        }
+        let mut run: Option<Cmd> = None;
+        if enter {
+            run = matches.get(self.pal_sel).map(|i| cmds[*i].1);
+        }
+        if esc {
+            self.pal_open = false;
+            return;
+        }
+
+        egui::Window::new("palette")
+            .title_bar(false)
+            .resizable(false)
+            .collapsible(false)
+            .anchor(egui::Align2::CENTER_TOP, [0.0, 70.0])
+            .fixed_size([560.0, 0.0])
+            .frame(
+                egui::Frame::new()
+                    .fill(CARD)
+                    .stroke(Stroke::new(1.5, CYAN))
+                    .corner_radius(CornerRadius::same(12))
+                    .inner_margin(Margin::same(14)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(mono("pip>", GREEN));
+                    let r = ui.add(
+                        egui::TextEdit::singleline(&mut self.pal_query)
+                            .hint_text("type a page or an action: agenda, note, focus, coin...")
+                            .desired_width(f32::INFINITY),
+                    );
+                    if self.pal_focus {
+                        r.request_focus();
+                        self.pal_focus = false;
+                    }
+                });
+                ui.separator();
+                if matches.is_empty() {
+                    ui.label(mono("no match", DIM));
+                }
+                for (rank, i) in matches.iter().enumerate() {
+                    let selected = rank == self.pal_sel;
+                    let resp = ui.selectable_label(selected, mono(&cmds[*i].0, if selected { AMBER } else { TEXT }));
+                    if resp.clicked() {
+                        run = Some(cmds[*i].1);
+                    }
+                }
+                ui.label(mono("enter = run   up/down = choose   esc = close", DIM));
+            });
+
+        if let Some(cmd) = run {
+            self.pal_open = false;
+            self.run_cmd(cmd);
+        }
+    }
+
+    // ------------------------------------------------- connect calendar popup
+
+    fn connect_window(&mut self, ctx: &egui::Context) {
+        if !self.connect_open {
+            return;
+        }
+        let mut open = true;
+        egui::Window::new("Connect your calendar")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .fixed_size([640.0, 0.0])
+            .frame(
+                egui::Frame::new()
+                    .fill(PANEL)
+                    .stroke(Stroke::new(1.5, AMBER))
+                    .corner_radius(CornerRadius::same(14))
+                    .inner_margin(Margin::same(18)),
+            )
+            .show(ctx, |ui| {
+                tab_bar(ui, &mut self.connect_tab, &["quick link (easy)", "google sign-in (calendar + mail)"]);
+                if self.connect_tab == 0 {
+                    self.connect_link(ui);
+                } else {
+                    self.connect_google_tab(ui);
+                }
+            });
+        if !open {
+            self.connect_open = false;
+        }
+    }
+
+    fn connect_link(&mut self, ui: &mut Ui) {
+        ui.label(RichText::new("Link your Google Calendar in 3 steps. No Google Cloud, no sign-in.").strong());
+        ui.label(mono("pip only reads the link; it can't change your calendar", DIM));
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label(mono("1", CYAN));
+            if action(ui, "open google calendar settings", AMBER).clicked() {
+                open_url("https://calendar.google.com/calendar/u/0/r/settings");
+            }
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.label(mono("2", CYAN));
+            ui.label("Click your calendar on the left, scroll to \"Integrate calendar\" and copy the");
+            ui.label(RichText::new("Secret address in iCal format").strong().color(AMBER));
+        });
+        ui.horizontal(|ui| {
+            ui.label(mono("3", CYAN));
+            if action(ui, "paste from clipboard", CYAN).clicked() {
+                if let Some(t) = sysinfo::clipboard_text() {
+                    self.ical_input = t.trim().to_string();
+                }
+            }
+            text_field(ui, &mut self.ical_input, "https://calendar.google.com/calendar/ical/.../basic.ics", 330.0);
+        });
+        ui.horizontal(|ui| {
+            let can = !self.ical_input.trim().is_empty() && !self.ical_busy;
+            let label = if self.ical_busy { "checking..." } else { "test and link" };
+            if ui.add_enabled(can, egui::Button::new(mono(label, INK).strong()).fill(GREEN)).clicked() {
+                let url = self.ical_input.trim().to_string();
+                let slot = self.ical_slot.clone();
+                let ctx = ui.ctx().clone();
+                self.ical_busy = true;
+                self.ical_note = "Checking the link...".into();
+                std::thread::spawn(move || {
+                    let r = ical::fetch(&url, 14).map(|e| (url.clone(), e.len()));
+                    *slot.lock().unwrap() = Some(r);
+                    ctx.request_repaint();
+                });
+            }
+            if !self.cfg.ical_url.is_empty() && ghost(ui, "remove link").clicked() {
+                self.cfg.ical_url.clear();
+                self.sh.events.lock().unwrap().clear();
+                *self.sh.last_fetch.lock().unwrap() = None;
+                self.ical_note = "Link removed.".into();
+            }
+        });
+        if !self.ical_note.is_empty() {
+            let ok = self.ical_note.starts_with("Linked");
+            ui.colored_label(if ok { GREEN } else { AMBER }, &self.ical_note);
+        }
+        if !self.cfg.ical_url.is_empty() {
+            pill(ui, "link active", GREEN);
+        }
+        ui.label(mono("tip: anyone with this link can read your calendar. keep it private.", DIM));
+    }
+
+    fn connect_google_tab(&mut self, ui: &mut Ui) {
+        ui.label(RichText::new("Full Google sign-in: needed for Gmail mail slips.").strong());
+        ui.label(mono("a free one-time setup in Google Cloud, then it's one click", DIM));
+        ui.add_space(4.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.label(mono("1", CYAN));
+            if ghost(ui, "open Calendar API").clicked() {
+                open_url("https://console.cloud.google.com/apis/library/calendar-json.googleapis.com");
+            }
+            if ghost(ui, "open Gmail API").clicked() {
+                open_url("https://console.cloud.google.com/apis/library/gmail.googleapis.com");
+            }
+            ui.label("press Enable on each");
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.label(mono("2", CYAN));
+            if ghost(ui, "open consent screen").clicked() {
+                open_url("https://console.cloud.google.com/apis/credentials/consent");
+            }
+            ui.label("External, add yourself as a test user");
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.label(mono("3", CYAN));
+            if ghost(ui, "open credentials").clicked() {
+                open_url("https://console.cloud.google.com/apis/credentials");
+            }
+            ui.label("Create credentials > OAuth client ID > Desktop app > Download JSON");
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.label(mono("4", CYAN));
+            ui.label("Drop the downloaded .json on this window, or");
+            if action(ui, "paste path or JSON", CYAN).clicked() {
+                match sysinfo::clipboard_text().and_then(|t| parse_client(&t)) {
+                    Some((id, secret)) => {
+                        self.cfg.google_client_id = id;
+                        self.cfg.google_client_secret = secret;
+                        self.client_note = "Client loaded. Now press sign in.".into();
+                    }
+                    None => self.client_note = "The clipboard doesn't hold the client JSON (or a path to it).".into(),
+                }
+            }
+        });
+        let loaded = !self.cfg.google_client_id.is_empty() && !self.cfg.google_client_secret.is_empty();
+        ui.horizontal(|ui| {
+            ui.label(mono("5", CYAN));
+            toggle(ui, &mut self.connect_mail, "also allow reading Gmail");
+            let label = if self.google_busy { "waiting for browser..." } else { "sign in with google" };
+            if ui.add_enabled(loaded && !self.google_busy, egui::Button::new(mono(label, INK).strong()).fill(GREEN)).clicked() {
+                self.connect_google(ui.ctx().clone());
+            }
+            if loaded {
+                pill(ui, "client loaded", GREEN);
+            }
+        });
+        if !self.client_note.is_empty() {
+            ui.colored_label(AMBER, &self.client_note);
+        }
+        if !self.cfg.google_refresh_token.is_empty() {
+            ui.horizontal(|ui| {
+                pill(ui, "signed in", GREEN);
+                if ghost(ui, "sign out").clicked() {
+                    self.cfg.google_refresh_token.clear();
+                    self.cfg.google_has_mail = false;
+                }
+            });
+        }
+    }
+
+    fn connect_google(&mut self, ctx: egui::Context) {
+        let id = self.cfg.google_client_id.trim().to_string();
+        let secret = self.cfg.google_client_secret.trim().to_string();
+        let with_mail = self.connect_mail;
+        let slot = self.google.clone();
+        self.google_busy = true;
+        self.client_note = "Opening your browser for Google sign-in...".into();
+        std::thread::spawn(move || {
+            let r = gcal::connect(&id, &secret, with_mail);
+            *slot.lock().unwrap() = Some(r);
+            ctx.request_repaint();
+        });
+    }
+
     // --------------------------------------------------------------- Home
 
-    fn tile(&self, ui: &mut Ui, width: f32, tag: &str, value: &str, sub: &str, color: Color32) {
-        egui::Frame::new()
+    fn tile(&self, ui: &mut Ui, width: f32, tag: &str, value: &str, sub: &str, color: Color32) -> bool {
+        let r = egui::Frame::new()
             .fill(CARD)
             .stroke(Stroke::new(1.0, BORDER))
             .corner_radius(CornerRadius::same(12))
@@ -519,6 +1151,10 @@ impl Dash {
                     ui.add(egui::Label::new(RichText::new(sub).size(12.0).color(DIM)).truncate());
                 });
             });
+        r.response
+            .interact(egui::Sense::click())
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .clicked()
     }
 
     fn page_home(&mut self, ui: &mut Ui) {
@@ -560,59 +1196,80 @@ impl Dash {
             });
         });
 
+        self.setup_checklist(ui);
+
         // status tiles
         let (focus_value, focus_sub, focus_color) = match self.countdown() {
             Some((phase, secs)) => (fmt_countdown(secs), format!("{phase} - running"), AMBER),
             None => ("idle".to_string(), "no focus timer".to_string(), DIM),
         };
         let open = self.data.todos.iter().filter(|t| !t.done).count();
-        let next = self
-            .sh
-            .events
-            .lock()
-            .unwrap()
-            .iter()
-            .find(|e| e.start > now)
-            .cloned();
-        // four tiles that share the row evenly (each adds 28 px margin + 2 px stroke + 10 px gap)
+        let next = self.sh.events.lock().unwrap().iter().find(|e| e.start > now).cloned();
+        let counts = app::countdown_list(&self.data);
         let tw = ((ui.available_width() - 4.0 * 30.0 - 3.0 * 10.0) / 4.0).max(110.0);
+        let mut go: Option<(Page, usize)> = None;
         ui.horizontal(|ui| {
-            self.tile(
-                ui,
-                tw,
-                "PRINTER",
-                if self.printer_ok() { "online" } else { "offline" },
-                &self.cfg.printer,
-                if self.printer_ok() { GREEN } else { RED },
-            );
-            self.tile(ui, tw, "FOCUS", &focus_value, &focus_sub, focus_color);
-            self.tile(ui, tw, "TASKS", &format!("{open} open"), &format!("{} total", self.data.todos.len()), CYAN);
-            match &next {
+            let printer_text = if self.printer_ok() { "online" } else { "offline" };
+            if self.tile(ui, tw, "PRINTER", printer_text, &self.cfg.printer, if self.printer_ok() { GREEN } else { RED }) {
+                go = Some((Page::Settings, 0));
+            }
+            if self.tile(ui, tw, "FOCUS", &focus_value, &focus_sub, focus_color) {
+                go = Some((Page::Schedule, 4));
+            }
+            if self.tile(ui, tw, "TASKS", &format!("{open} open"), &format!("{} notes", self.data.notes.iter().filter(|n| !n.archived).count()), CYAN) {
+                go = Some((Page::Tasks, 0));
+            }
+            let clicked = match &next {
                 Some(e) => self.tile(ui, tw, "NEXT EVENT", &e.start.format("%a %H:%M").to_string(), &e.summary, AMBER),
-                None => self.tile(ui, tw, "NEXT EVENT", "none", if self.sh.connected() { "calendar is clear" } else { "connect Google" }, DIM),
+                None => self.tile(ui, tw, "NEXT EVENT", "none", if self.sh.connected() { "calendar is clear" } else { "link your calendar" }, DIM),
+            };
+            if clicked {
+                go = Some((Page::Schedule, 0));
             }
         });
+        if let Some((p, t)) = go {
+            self.goto(p, t);
+        }
+
+        if let Some((name, days)) = counts.iter().find(|c| c.1 >= 0) {
+            card(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(mono("countdown", CYAN));
+                    ui.label(RichText::new(name).strong());
+                    ui.label(mono(if *days == 0 { "TODAY" } else { "in" }, DIM));
+                    if *days > 0 {
+                        ui.label(RichText::new(format!("{days} days")).size(18.0).strong().color(AMBER));
+                    }
+                });
+            });
+        }
 
         // quick actions
         section(ui, "$", "quick actions", |ui| {
             ui.horizontal_wrapped(|ui| {
                 if action(ui, "print agenda", AMBER).clicked() {
-                    self.job("Printed today's agenda", |s| s.print_agenda(true));
+                    self.run_cmd(Cmd::PrintAgenda);
                 }
                 if action(ui, "morning briefing", CYAN).clicked() {
-                    self.job("Printed your morning briefing", |s| s.print_briefing());
+                    self.run_cmd(Cmd::Briefing);
                 }
                 if action(ui, "end-of-day receipt", PINK).clicked() {
-                    self.job("Printed your end-of-day receipt", |s| s.print_end_of_day());
+                    self.run_cmd(Cmd::EndOfDay);
                 }
                 if action(ui, "to-do list", GREEN).clicked() {
-                    let todos = self.data.todos.clone();
-                    self.job("Printed your to-do list", move |s| s.print(escpos::todo_list(&s.cfg(), &todos)));
+                    self.run_cmd(Cmd::Todos);
+                }
+                if action(ui, "new note", AMBER).clicked() {
+                    self.run_cmd(Cmd::NewNote);
+                }
+                if action(ui, "fortune cookie", CYAN).clicked() {
+                    self.run_cmd(Cmd::Fortune);
                 }
                 if action(ui, "test slip", DIM).clicked() {
-                    self.job("Test slip printed", |s| s.print(escpos::test_slip(&s.cfg())));
+                    self.run_cmd(Cmd::TestSlip);
                 }
             });
+            ui.label(mono("tip: ctrl+k opens search. type anything, hit enter.", DIM));
         });
 
         // fake terminal log
@@ -634,6 +1291,40 @@ impl Dash {
         });
     }
 
+    fn setup_checklist(&mut self, ui: &mut Ui) {
+        if self.cfg.setup_dismissed {
+            return;
+        }
+        let items: [(&str, bool, Page, usize); 4] = [
+            ("pick your printer", self.printer_ok(), Page::Settings, 0),
+            ("print a test slip", self.cfg.did_test, Page::Settings, 0),
+            ("link your calendar", self.cfg.calendar_linked(), Page::Settings, 2),
+            ("set a morning briefing", self.cfg.briefing, Page::Schedule, 2),
+        ];
+        let done = items.iter().filter(|i| i.1).count();
+        if done == items.len() {
+            return;
+        }
+        section(ui, "setup", &format!("getting started  {done}/{}", items.len()), |ui| {
+            for (label, ok, page, tab) in items {
+                ui.horizontal(|ui| {
+                    ui.label(mono(if ok { "[x]" } else { "[ ]" }, if ok { GREEN } else { AMBER }));
+                    ui.label(if ok { RichText::new(label).color(DIM) } else { RichText::new(label) });
+                    if !ok && ghost(ui, "do it").clicked() {
+                        if label == "link your calendar" {
+                            self.connect_open = true;
+                        } else {
+                            self.goto(page, tab);
+                        }
+                    }
+                });
+            }
+            if small_btn(ui, "hide this").clicked() {
+                self.cfg.setup_dismissed = true;
+            }
+        });
+    }
+
     /// (phase, seconds left) while the focus timer runs.
     fn countdown(&self) -> Option<(String, i64)> {
         let p = &self.data.pomodoro;
@@ -644,16 +1335,289 @@ impl Dash {
         Some((p.phase.clone(), (ends.with_timezone(&Local) - Local::now()).num_seconds()))
     }
 
+    // -------------------------------------------------------------- Notes
+
+    fn page_notes(&mut self, ui: &mut Ui) {
+        page_title(ui, "~/notes", "// quick notes and checklists, keep-style");
+
+        // composer
+        section(ui, "+", "new note", |ui| {
+            let title = ui.add(egui::TextEdit::singleline(&mut self.n_title).hint_text("title (optional)").desired_width(f32::INFINITY));
+            if self.n_focus {
+                title.request_focus();
+                self.n_focus = false;
+            }
+            ui.add(
+                egui::TextEdit::multiline(&mut self.n_body)
+                    .hint_text(if self.n_check { "one item per line" } else { "take a note..." })
+                    .desired_rows(3)
+                    .desired_width(f32::INFINITY),
+            );
+            ui.horizontal_wrapped(|ui| {
+                toggle(ui, &mut self.n_check, "checklist");
+                ui.label(mono("labels", DIM));
+                text_field(ui, &mut self.n_labels, "work, ideas", 160.0);
+                swatches(ui, &mut self.n_color);
+            });
+            ui.horizontal(|ui| {
+                if action(ui, "save note", AMBER).clicked() {
+                    self.save_new_note(false);
+                }
+                if action(ui, "save + print", CYAN).clicked() {
+                    self.save_new_note(true);
+                }
+                if ghost(ui, "clear").clicked() {
+                    self.n_title.clear();
+                    self.n_body.clear();
+                }
+            });
+        });
+
+        // search + filters
+        ui.horizontal_wrapped(|ui| {
+            text_field(ui, &mut self.n_search, "search notes", 220.0);
+            let mut labels: Vec<String> = self
+                .data
+                .notes
+                .iter()
+                .filter(|n| n.archived == self.n_archived)
+                .flat_map(|n| n.labels.clone())
+                .collect();
+            labels.sort();
+            labels.dedup();
+            for l in labels {
+                let active = self.n_filter.as_deref() == Some(l.as_str());
+                if ui.selectable_label(active, mono(&format!("#{l}"), if active { AMBER } else { CYAN })).clicked() {
+                    self.n_filter = if active { None } else { Some(l) };
+                }
+            }
+            toggle(ui, &mut self.n_archived, "archive");
+        });
+
+        let q = self.n_search.to_lowercase();
+        let mut notes: Vec<Note> = self
+            .data
+            .notes
+            .iter()
+            .filter(|n| n.archived == self.n_archived)
+            .filter(|n| self.n_filter.as_ref().map_or(true, |f| n.labels.contains(f)))
+            .filter(|n| {
+                q.is_empty()
+                    || n.title.to_lowercase().contains(&q)
+                    || n.body.to_lowercase().contains(&q)
+                    || n.items.iter().any(|i| i.text.to_lowercase().contains(&q))
+                    || n.labels.iter().any(|l| l.to_lowercase().contains(&q))
+            })
+            .cloned()
+            .collect();
+        notes.sort_by(|a, b| b.pinned.cmp(&a.pinned).then(b.updated.cmp(&a.updated)));
+
+        if notes.is_empty() {
+            ui.label(mono(if self.n_archived { "no archived notes" } else { "no notes yet. jot something down!" }, DIM));
+            return;
+        }
+        let cols = ((ui.available_width() / 300.0) as usize).clamp(1, 3);
+        ui.columns(cols, |columns| {
+            for (i, n) in notes.iter().enumerate() {
+                self.note_card(&mut columns[i % cols], n);
+            }
+        });
+    }
+
+    fn save_new_note(&mut self, print: bool) {
+        if self.n_title.trim().is_empty() && self.n_body.trim().is_empty() {
+            return;
+        }
+        let labels: Vec<String> = self
+            .n_labels
+            .split(',')
+            .map(|l| l.trim().trim_start_matches('#').to_lowercase())
+            .filter(|l| !l.is_empty())
+            .collect();
+        let items: Vec<NoteItem> = if self.n_check {
+            self.n_body
+                .lines()
+                .map(|l| l.trim().trim_start_matches("[ ]").trim_start_matches("- ").trim())
+                .filter(|l| !l.is_empty())
+                .map(|l| NoteItem { text: l.to_string(), done: false })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let note_template = Note {
+            id: 0,
+            title: self.n_title.trim().to_string(),
+            body: if self.n_check { String::new() } else { self.n_body.trim_end().to_string() },
+            checklist: self.n_check,
+            items,
+            color: self.n_color,
+            pinned: false,
+            archived: false,
+            labels,
+            updated: Local::now().to_rfc3339(),
+        };
+        let for_print = note_template.clone();
+        self.change_data(|d| {
+            let id = d.new_id();
+            d.notes.push(Note { id, ..note_template });
+        });
+        if print {
+            self.job("Printed the note", move |s| s.print(escpos::note_slip(&s.cfg(), &for_print)));
+        }
+        self.n_title.clear();
+        self.n_body.clear();
+        self.n_labels.clear();
+        self.say("Note saved");
+    }
+
+    fn note_card(&mut self, ui: &mut Ui, n: &Note) {
+        let color = NOTE_COLORS[(n.color as usize).min(NOTE_COLORS.len() - 1)].1;
+        let width = (ui.available_width() - 34.0).max(120.0);
+        let id = n.id;
+        egui::Frame::new()
+            .fill(color)
+            .stroke(Stroke::new(1.0, lighten(color)))
+            .corner_radius(CornerRadius::same(12))
+            .inner_margin(Margin::same(14))
+            .show(ui, |ui| {
+                ui.set_width(width);
+                if self.editing == Some(id) {
+                    ui.add(egui::TextEdit::singleline(&mut self.edit_title).hint_text("title").desired_width(f32::INFINITY));
+                    ui.add(
+                        egui::TextEdit::multiline(&mut self.edit_body)
+                            .hint_text(if n.checklist { "one item per line" } else { "text" })
+                            .desired_rows(4)
+                            .desired_width(f32::INFINITY),
+                    );
+                    ui.horizontal(|ui| {
+                        if action(ui, "save", GREEN).clicked() {
+                            let (title, body) = (self.edit_title.trim().to_string(), self.edit_body.clone());
+                            self.change_data(|d| {
+                                if let Some(x) = d.notes.iter_mut().find(|x| x.id == id) {
+                                    x.title = title;
+                                    if x.checklist {
+                                        let old = x.items.clone();
+                                        x.items = body
+                                            .lines()
+                                            .map(|l| l.trim())
+                                            .filter(|l| !l.is_empty())
+                                            .map(|l| NoteItem {
+                                                text: l.to_string(),
+                                                done: old.iter().any(|o| o.text == l && o.done),
+                                            })
+                                            .collect();
+                                    } else {
+                                        x.body = body.trim_end().to_string();
+                                    }
+                                    x.updated = Local::now().to_rfc3339();
+                                }
+                            });
+                            self.editing = None;
+                        }
+                        if ghost(ui, "cancel").clicked() {
+                            self.editing = None;
+                        }
+                    });
+                    return;
+                }
+
+                if n.pinned {
+                    ui.label(mono("pinned", AMBER));
+                }
+                if !n.title.is_empty() {
+                    ui.label(RichText::new(&n.title).strong().size(16.0));
+                }
+                if n.checklist {
+                    for (i, it) in n.items.iter().enumerate() {
+                        let mut done = it.done;
+                        let label = if it.done { RichText::new(&it.text).strikethrough().color(DIM) } else { RichText::new(&it.text) };
+                        if ui.checkbox(&mut done, label).changed() {
+                            self.change_data(|d| {
+                                if let Some(x) = d.notes.iter_mut().find(|x| x.id == id) {
+                                    if let Some(item) = x.items.get_mut(i) {
+                                        item.done = done;
+                                    }
+                                }
+                            });
+                        }
+                    }
+                } else if !n.body.is_empty() {
+                    ui.label(&n.body);
+                }
+                if !n.labels.is_empty() {
+                    ui.horizontal_wrapped(|ui| {
+                        for l in &n.labels {
+                            ui.label(mono(&format!("#{l}"), CYAN));
+                        }
+                    });
+                }
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing.x = 5.0;
+                    if small_btn(ui, if n.pinned { "unpin" } else { "pin" }).clicked() {
+                        self.change_data(|d| {
+                            if let Some(x) = d.notes.iter_mut().find(|x| x.id == id) {
+                                x.pinned = !x.pinned;
+                            }
+                        });
+                    }
+                    if small_btn(ui, "color").clicked() {
+                        self.change_data(|d| {
+                            if let Some(x) = d.notes.iter_mut().find(|x| x.id == id) {
+                                x.color = (x.color + 1) % NOTE_COLORS.len() as u8;
+                            }
+                        });
+                    }
+                    if small_btn(ui, "edit").clicked() {
+                        self.editing = Some(id);
+                        self.edit_title = n.title.clone();
+                        self.edit_body = if n.checklist {
+                            n.items.iter().map(|i| i.text.clone()).collect::<Vec<_>>().join("\n")
+                        } else {
+                            n.body.clone()
+                        };
+                    }
+                    if small_btn(ui, "print").clicked() {
+                        let note = n.clone();
+                        self.job("Printed the note", move |s| s.print(escpos::note_slip(&s.cfg(), &note)));
+                    }
+                    if small_btn(ui, if n.archived { "restore" } else { "archive" }).clicked() {
+                        self.change_data(|d| {
+                            if let Some(x) = d.notes.iter_mut().find(|x| x.id == id) {
+                                x.archived = !x.archived;
+                            }
+                        });
+                    }
+                    if small_btn(ui, "delete").clicked() {
+                        self.change_data(|d| d.notes.retain(|x| x.id != id));
+                    }
+                });
+            });
+    }
+
     // -------------------------------------------------------------- Print
 
     fn page_print(&mut self, ui: &mut Ui) {
-        page_title(ui, "~/print", "// text, pictures, QR codes and stickers");
+        let mut tab = self.tab();
+        page_title(ui, &format!("~/print/{}", PRINT_TABS[tab].replace(' ', "-")), "// text, pictures, tickets, labels and fun");
+        tab_bar(ui, &mut tab, &PRINT_TABS);
+        self.tabs[Page::Print.idx()] = tab;
+        match tab {
+            0 => self.print_text(ui),
+            1 => self.print_picture(ui),
+            2 => self.print_qr(ui),
+            3 => self.print_tickets(ui),
+            4 => self.print_labels(ui),
+            5 => self.print_stickers(ui),
+            _ => self.print_fun(ui),
+        }
+    }
 
+    fn print_text(&mut self, ui: &mut Ui) {
         section(ui, "01", "text", |ui| {
             ui.add(
                 egui::TextEdit::multiline(&mut self.txt)
                     .hint_text("type anything, or press ctrl+alt+p in any app to print what you selected")
-                    .desired_rows(5)
+                    .desired_rows(6)
                     .desired_width(f32::INFINITY),
             );
             ui.horizontal_wrapped(|ui| {
@@ -666,25 +1630,34 @@ impl Dash {
             ui.horizontal(|ui| {
                 if action(ui, "print text", AMBER).clicked() && !self.txt.trim().is_empty() {
                     let text = self.txt.clone();
-                    let o = TextOpts {
-                        bold: self.t_bold,
-                        big: self.t_big,
-                        center: self.t_center,
-                        stamp: self.t_stamp,
-                        checklist: self.t_check,
-                    };
+                    let o = TextOpts { bold: self.t_bold, big: self.t_big, center: self.t_center, stamp: self.t_stamp, checklist: self.t_check };
                     self.job("Printed", move |s| s.print(escpos::text_slip(&s.cfg(), &text, &o)));
+                }
+                if ghost(ui, "save as note").clicked() && !self.txt.trim().is_empty() {
+                    let body = self.txt.trim_end().to_string();
+                    self.change_data(|d| {
+                        let id = d.new_id();
+                        d.notes.push(Note { id, body, updated: Local::now().to_rfc3339(), ..Default::default() });
+                    });
+                    self.say("Saved as a note");
                 }
                 if ghost(ui, "clear").clicked() {
                     self.txt.clear();
                 }
             });
         });
+    }
 
+    fn print_picture(&mut self, ui: &mut Ui) {
         section(ui, "02", "picture", |ui| {
             ui.label(mono("drop a png / jpg / gif / webp anywhere on this window, or paste a path", DIM));
             ui.horizontal(|ui| {
                 text_field(ui, &mut self.img_path, r"C:\Pictures\cat.png", 420.0);
+                if ghost(ui, "paste").clicked() {
+                    if let Some(t) = sysinfo::clipboard_text() {
+                        self.img_path = t.trim().trim_matches('"').to_string();
+                    }
+                }
             });
             ui.horizontal(|ui| {
                 ui.label("brightness");
@@ -700,11 +1673,7 @@ impl Dash {
                 self.img_preview = None;
                 if !self.img_path.trim().is_empty() {
                     if let Ok(bm) = raster::from_file(self.img_path.trim(), 240, self.img_bright, self.img_smooth) {
-                        let pixels: Vec<Color32> = bm
-                            .dots
-                            .iter()
-                            .map(|d| if *d { Color32::BLACK } else { Color32::WHITE })
-                            .collect();
+                        let pixels: Vec<Color32> = bm.dots.iter().map(|d| if *d { Color32::BLACK } else { Color32::WHITE }).collect();
                         let img = egui::ColorImage { size: [bm.w, bm.h], source_size: egui::vec2(bm.w as f32, bm.h as f32), pixels };
                         self.img_preview = Some(ui.ctx().load_texture("preview", img, egui::TextureOptions::NEAREST));
                     }
@@ -722,42 +1691,98 @@ impl Dash {
                 });
             }
         });
+    }
 
-        section(ui, "03", "qr codes", |ui| {
+    fn print_qr(&mut self, ui: &mut Ui) {
+        section(ui, "03", "qr code", |ui| {
             ui.horizontal(|ui| {
                 text_field(ui, &mut self.qr_text, "a link or any text", 360.0);
                 if action(ui, "print qr", AMBER).clicked() && !self.qr_text.trim().is_empty() {
                     let t = self.qr_text.trim().to_string();
-                    self.job("Printed the QR code", move |s| {
-                        s.print(escpos::qr_slip(&s.cfg(), "SCAN ME", &t, &[t.clone()])?)
-                    });
-                }
-            });
-            ui.separator();
-            ui.label(mono("wi-fi slip for guests", DIM));
-            ui.horizontal(|ui| {
-                text_field(ui, &mut self.wifi_ssid, "network name", 200.0);
-                ui.add_enabled(!self.wifi_open, egui::TextEdit::singleline(&mut self.wifi_pass).hint_text("password").desired_width(200.0));
-                toggle(ui, &mut self.wifi_open, "open network");
-                if action(ui, "print wi-fi", CYAN).clicked() && !self.wifi_ssid.trim().is_empty() {
-                    let (ssid, pass, open) = (self.wifi_ssid.trim().to_string(), self.wifi_pass.clone(), self.wifi_open);
-                    self.job("Printed the Wi-Fi slip", move |s| {
-                        let code = if open {
-                            format!("WIFI:T:nopass;S:{};;", wifi_escape(&ssid))
-                        } else {
-                            format!("WIFI:T:WPA;S:{};P:{};;", wifi_escape(&ssid), wifi_escape(&pass))
-                        };
-                        let mut caption = vec![format!("Network: {ssid}")];
-                        if !open {
-                            caption.push(format!("Password: {pass}"));
-                        }
-                        s.print(escpos::qr_slip(&s.cfg(), "WI-FI", &code, &caption)?)
-                    });
+                    self.job("Printed the QR code", move |s| s.print(escpos::qr_slip(&s.cfg(), "SCAN ME", &t, &[t.clone()])?));
                 }
             });
         });
+        section(ui, "04", "wi-fi slip for guests", |ui| {
+            ui.horizontal_wrapped(|ui| {
+                text_field(ui, &mut self.wifi_ssid, "network name", 200.0);
+                ui.add_enabled(!self.wifi_open, egui::TextEdit::singleline(&mut self.wifi_pass).hint_text("password").desired_width(200.0));
+                toggle(ui, &mut self.wifi_open, "open network");
+            });
+            if action(ui, "print wi-fi", CYAN).clicked() && !self.wifi_ssid.trim().is_empty() {
+                let (ssid, pass, open) = (self.wifi_ssid.trim().to_string(), self.wifi_pass.clone(), self.wifi_open);
+                self.job("Printed the Wi-Fi slip", move |s| {
+                    let code = if open {
+                        format!("WIFI:T:nopass;S:{};;", wifi_escape(&ssid))
+                    } else {
+                        format!("WIFI:T:WPA;S:{};P:{};;", wifi_escape(&ssid), wifi_escape(&pass))
+                    };
+                    let mut caption = vec![format!("Network: {ssid}")];
+                    if !open {
+                        caption.push(format!("Password: {pass}"));
+                    }
+                    s.print(escpos::qr_slip(&s.cfg(), "WI-FI", &code, &caption)?)
+                });
+            }
+        });
+    }
 
-        section(ui, "04", "pip stickers", |ui| {
+    fn print_tickets(&mut self, ui: &mut Ui) {
+        section(ui, "05", "ticket maker", |ui| {
+            ui.label(mono("print a fancy ticket for anything: a trip, a date night, a coupon for a hug", DIM));
+            ui.horizontal(|ui| {
+                for (i, name) in ["event ticket", "boarding pass"].iter().enumerate() {
+                    if ui.selectable_label(self.tk_kind == i, mono(name, if self.tk_kind == i { AMBER } else { DIM })).clicked() {
+                        self.tk_kind = i;
+                    }
+                }
+            });
+            let labels: [&str; 6] = if self.tk_kind == 0 {
+                ["event", "date and time", "where", "seat", "price", ""]
+            } else {
+                ["from", "to", "date and time", "flight", "seat / gate", "passenger"]
+            };
+            for (i, l) in labels.iter().enumerate() {
+                if l.is_empty() {
+                    continue;
+                }
+                ui.horizontal(|ui| {
+                    ui.label(mono(&format!("{l:<14}"), DIM));
+                    text_field(ui, &mut self.tk[i], "", 340.0);
+                });
+            }
+            if action(ui, "print ticket", PINK).clicked() {
+                let t = self.tk.clone();
+                if self.tk_kind == 0 {
+                    self.job("Printed the ticket", move |s| s.print(escpos::event_ticket(&s.cfg(), &t[0], &t[1], &t[2], &t[3], &t[4])));
+                } else {
+                    self.job("Printed the boarding pass", move |s| {
+                        s.print(escpos::boarding_pass(&s.cfg(), &t[0], &t[1], &t[2], &t[3], &t[4], &t[5]))
+                    });
+                }
+            }
+        });
+    }
+
+    fn print_labels(&mut self, ui: &mut Ui) {
+        section(ui, "06", "label maker", |ui| {
+            ui.label(mono("big bold text for jars, boxes, cables and doors", DIM));
+            text_field(ui, &mut self.lb_text, "FRAGILE", 360.0);
+            ui.horizontal(|ui| {
+                ui.label("size");
+                ui.add(egui::Slider::new(&mut self.lb_scale, 1..=6));
+                ui.label("copies");
+                ui.add(egui::DragValue::new(&mut self.lb_copies).range(1..=10));
+            });
+            if action(ui, "print label", AMBER).clicked() && !self.lb_text.trim().is_empty() {
+                let (t, sc, n) = (self.lb_text.trim().to_string(), self.lb_scale, self.lb_copies);
+                self.job("Printed the label", move |s| s.print(escpos::big_label(&s.cfg(), &t, sc, n)));
+            }
+        });
+    }
+
+    fn print_stickers(&mut self, ui: &mut Ui) {
+        section(ui, "07", "pip stickers", |ui| {
             ui.horizontal_wrapped(|ui| {
                 for (i, (name, mood)) in STICKERS.iter().enumerate() {
                     let selected = self.sticker == i;
@@ -776,20 +1801,121 @@ impl Dash {
         });
     }
 
+    fn print_fun(&mut self, ui: &mut Ui) {
+        section(ui, "08", "pip decides", |ui| {
+            ui.label(mono("can't choose? let a robot printer do it", DIM));
+            ui.horizontal_wrapped(|ui| {
+                if action(ui, "flip a coin", AMBER).clicked() {
+                    self.flip_coin();
+                }
+                if action(ui, "roll d6", CYAN).clicked() {
+                    self.fun_kind = 0;
+                    self.fun_title = "d6".into();
+                    self.fun_text = (1 + pip::rand(6)).to_string();
+                }
+                if action(ui, "roll d20", CYAN).clicked() {
+                    self.fun_kind = 0;
+                    self.fun_title = "d20".into();
+                    self.fun_text = (1 + pip::rand(20)).to_string();
+                }
+            });
+            ui.horizontal(|ui| {
+                text_field(ui, &mut self.fun_question, "ask a yes/no question", 300.0);
+                if action(ui, "magic 8-ball", PINK).clicked() {
+                    self.fun_kind = 0;
+                    self.fun_title = if self.fun_question.trim().is_empty() { "8-ball".into() } else { self.fun_question.trim().to_string() };
+                    self.fun_text = pip::eight_ball().into();
+                }
+            });
+            ui.add(egui::TextEdit::multiline(&mut self.fun_list).hint_text("or list options, one per line, and let pip pick").desired_rows(3).desired_width(420.0));
+            if action(ui, "pick one", GREEN).clicked() {
+                let opts: Vec<&str> = self.fun_list.lines().map(|l| l.trim()).filter(|l| !l.is_empty()).collect();
+                if !opts.is_empty() {
+                    self.fun_kind = 0;
+                    self.fun_title = "pip picks".into();
+                    self.fun_text = opts[pip::rand(opts.len())].to_string();
+                }
+            }
+        });
+        section(ui, "09", "fortune cookie and jokes", |ui| {
+            ui.horizontal(|ui| {
+                if action(ui, "fortune", AMBER).clicked() {
+                    self.fun_kind = 1;
+                    self.fun_title = "FORTUNE".into();
+                    self.fun_text = pip::fortune().into();
+                }
+                if action(ui, "joke", CYAN).clicked() {
+                    self.fun_kind = 2;
+                    self.fun_title = "JOKE".into();
+                    self.fun_text = pip::joke().into();
+                }
+            });
+        });
+        if !self.fun_text.is_empty() {
+            card(ui, |ui| {
+                ui.label(mono(&self.fun_title, DIM));
+                ui.label(RichText::new(&self.fun_text).size(22.0).strong().color(AMBER));
+                if action(ui, "print it", PINK).clicked() {
+                    let (kind, title, text) = (self.fun_kind, self.fun_title.clone(), self.fun_text.clone());
+                    self.job("Printed", move |s| {
+                        let cfg = s.cfg();
+                        s.print(match kind {
+                            1 => escpos::fortune_slip(&cfg, "FORTUNE", &text, true),
+                            2 => escpos::fortune_slip(&cfg, "JOKE", &text, false),
+                            _ => escpos::decide_slip(&cfg, &title, &text),
+                        })
+                    });
+                }
+            });
+        }
+    }
+
     // ----------------------------------------------------------- Schedule
 
     fn page_schedule(&mut self, ui: &mut Ui) {
-        page_title(ui, "~/schedule", "// calendar, briefings, reminders and focus");
+        let mut tab = self.tab();
+        page_title(ui, &format!("~/schedule/{}", SCHED_TABS[tab].replace(' ', "-")), "// calendar, briefings, reminders and focus");
+        tab_bar(ui, &mut tab, &SCHED_TABS);
+        self.tabs[Page::Schedule.idx()] = tab;
+        match tab {
+            0 => self.sched_calendar(ui),
+            1 => self.sched_agenda(ui),
+            2 => self.sched_briefing(ui),
+            3 => self.sched_reminders(ui),
+            4 => self.sched_focus(ui),
+            5 => self.sched_eod(ui),
+            _ => self.sched_planner(ui),
+        }
+    }
 
+    fn sched_calendar(&mut self, ui: &mut Ui) {
         section(ui, "01", "calendar", |ui| {
             if !self.sh.connected() {
-                ui.label("Not connected. Link your Google Calendar in settings to see events here and on your slips.");
-                if action(ui, "go to settings", AMBER).clicked() {
-                    self.page = Page::Settings;
+                ui.label("Pip can't see your calendar yet. Link it in about a minute, no Google Cloud needed.");
+                if action(ui, "connect calendar", AMBER).clicked() {
+                    self.connect_open = true;
                 }
                 return;
             }
-            let events: Vec<_> = self.sh.events.lock().unwrap().iter().filter(|e| e.start >= Local::now() - chrono::Duration::hours(1)).take(7).cloned().collect();
+            ui.horizontal(|ui| {
+                pill(ui, if self.cfg.ical_url.is_empty() { "google sign-in" } else { "calendar link" }, GREEN);
+                if ghost(ui, "refresh").clicked() {
+                    self.job("Calendar updated", |s| s.refresh_events());
+                }
+                if ghost(ui, "change").clicked() {
+                    self.connect_open = true;
+                }
+            });
+            let events: Vec<_> = self
+                .sh
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|e| e.start >= Local::now() - chrono::Duration::hours(1))
+                .take(10)
+                .cloned()
+                .collect();
             if events.is_empty() {
                 ui.label(mono("nothing coming up. suspicious.", DIM));
             }
@@ -799,11 +1925,10 @@ impl Dash {
                     ui.label(&e.summary);
                 });
             }
-            if ghost(ui, "refresh").clicked() {
-                self.job("Calendar updated", |s| s.refresh_events());
-            }
         });
+    }
 
+    fn sched_agenda(&mut self, ui: &mut Ui) {
         section(ui, "02", "agenda and stubs", |ui| {
             toggle(ui, &mut self.cfg.auto_agenda, "print the agenda every day at");
             ui.horizontal(|ui| {
@@ -822,10 +1947,15 @@ impl Dash {
                 ui.add(egui::DragValue::new(&mut self.cfg.stub_minutes).range(1..=240));
                 ui.label("minutes before each event");
             });
+            if action(ui, "print agenda now", AMBER).clicked() {
+                self.run_cmd(Cmd::PrintAgenda);
+            }
         });
+    }
 
+    fn sched_briefing(&mut self, ui: &mut Ui) {
         section(ui, "03", "morning briefing", |ui| {
-            ui.label(mono("weather + agenda + to-dos + a line from pip, all on one slip", DIM));
+            ui.label(mono("weather + agenda + to-dos + countdowns + a line from pip, all on one slip", DIM));
             ui.horizontal(|ui| {
                 toggle(ui, &mut self.cfg.briefing, "print every day at");
                 let (mut h, mut m) = (self.cfg.briefing_hour, self.cfg.briefing_minute);
@@ -843,27 +1973,51 @@ impl Dash {
                 }
             });
             if action(ui, "print briefing now", CYAN).clicked() {
-                self.job("Printed your morning briefing", |s| s.print_briefing());
+                self.run_cmd(Cmd::Briefing);
             }
         });
+    }
 
+    fn sched_reminders(&mut self, ui: &mut Ui) {
         section(ui, "04", "reminders and timers", |ui| {
+            text_field(ui, &mut self.new_reminder, "remind me to...", 360.0);
             ui.horizontal_wrapped(|ui| {
-                text_field(ui, &mut self.new_reminder, "remind me to...", 260.0);
-                ui.label("in");
-                ui.add(egui::DragValue::new(&mut self.reminder_min).range(1..=1440));
-                ui.label("min");
+                if ui.selectable_label(!self.rem_at, mono("in", if !self.rem_at { AMBER } else { DIM })).clicked() {
+                    self.rem_at = false;
+                }
+                ui.add_enabled(!self.rem_at, egui::DragValue::new(&mut self.rem_min).range(1..=1440).suffix(" min"));
+                if ui.selectable_label(self.rem_at, mono("at", if self.rem_at { AMBER } else { DIM })).clicked() {
+                    self.rem_at = true;
+                }
+                ui.add_enabled_ui(self.rem_at, |ui| time_edit(ui, &mut self.rem_h, &mut self.rem_m));
+                ui.label("repeat");
+                egui::ComboBox::from_id_salt("repeat").selected_text(REPEATS[self.rem_repeat].0).show_ui(ui, |ui| {
+                    for (i, (name, _)) in REPEATS.iter().enumerate() {
+                        ui.selectable_value(&mut self.rem_repeat, i, *name);
+                    }
+                });
                 if action(ui, "add", AMBER).clicked() && !self.new_reminder.trim().is_empty() {
-                    let (text, mins) = (self.new_reminder.trim().to_string(), self.reminder_min);
-                    self.add_reminder(text, mins);
+                    let now = Local::now();
+                    let due = if self.rem_at {
+                        let mut t = now.date_naive().and_hms_opt(self.rem_h, self.rem_m, 0).and_then(|n| Local.from_local_datetime(&n).earliest()).unwrap_or(now);
+                        if t <= now {
+                            t += chrono::Duration::days(1);
+                        }
+                        t
+                    } else {
+                        now + chrono::Duration::minutes(self.rem_min as i64)
+                    };
+                    let text = self.new_reminder.trim().to_string();
+                    let repeat = REPEATS[self.rem_repeat].1.to_string();
+                    self.add_reminder(text, due, repeat);
                     self.new_reminder.clear();
                 }
             });
             ui.horizontal(|ui| {
                 ui.label(mono("quick timers:", DIM));
-                for mins in [5u32, 10, 15, 30, 60] {
+                for mins in [5i64, 10, 15, 30, 60] {
                     if ghost(ui, &format!("{mins}m")).clicked() {
-                        self.add_reminder("Timer finished".into(), mins);
+                        self.add_reminder("Timer finished".into(), Local::now() + chrono::Duration::minutes(mins), String::new());
                     }
                 }
             });
@@ -871,10 +2025,13 @@ impl Dash {
             for r in upcoming {
                 ui.horizontal(|ui| {
                     let when = chrono::DateTime::parse_from_rfc3339(&r.due)
-                        .map(|d| d.with_timezone(&Local).format("%H:%M").to_string())
+                        .map(|d| d.with_timezone(&Local).format("%a %H:%M").to_string())
                         .unwrap_or_default();
                     ui.label(mono(&when, AMBER));
                     ui.label(&r.text);
+                    if !r.repeat.is_empty() {
+                        pill(ui, &r.repeat, CYAN);
+                    }
                     if ghost(ui, "x").clicked() {
                         let id = r.id;
                         self.change_data(|d| d.reminders.retain(|x| x.id != id));
@@ -882,7 +2039,18 @@ impl Dash {
                 });
             }
         });
+    }
 
+    fn add_reminder(&mut self, text: String, due: chrono::DateTime<Local>, repeat: String) {
+        let due = due.to_rfc3339();
+        self.change_data(|d| {
+            let id = d.new_id();
+            d.reminders.push(data::Reminder { id, text, due, fired: false, repeat });
+        });
+        self.say("Reminder set");
+    }
+
+    fn sched_focus(&mut self, ui: &mut Ui) {
         section(ui, "05", "focus timer (pomodoro)", |ui| {
             let sessions = self.data.pomo_sessions.get(&Local::now().format("%Y-%m-%d").to_string()).copied().unwrap_or(0);
             match self.countdown() {
@@ -892,7 +2060,6 @@ impl Dash {
                     if action(ui, "stop", RED).clicked() {
                         self.change_data(|d| d.pomodoro.running = false);
                     }
-                    ui.ctx().request_repaint_after(Duration::from_millis(400));
                 }
                 None => {
                     text_field(ui, &mut self.pomo_task, "what are you working on?", 320.0);
@@ -904,20 +2071,15 @@ impl Dash {
                         ui.label("min");
                     });
                     if action(ui, "start focus", AMBER).clicked() {
-                        let task = self.pomo_task.trim().to_string();
-                        let mins = self.cfg.pomo_work;
-                        self.change_data(|d| {
-                            d.pomodoro.running = true;
-                            d.pomodoro.phase = "work".into();
-                            d.pomodoro.task = task;
-                            d.pomodoro.ends_at = (Local::now() + chrono::Duration::minutes(mins as i64)).to_rfc3339();
-                        });
+                        self.toggle_focus();
                     }
                 }
             }
             ui.label(mono(&format!("sessions today: {sessions}  (a stamp card prints after each one)"), DIM));
         });
+    }
 
+    fn sched_eod(&mut self, ui: &mut Ui) {
         section(ui, "06", "end-of-day receipt", |ui| {
             ui.label(mono("a funny receipt of your day: meetings, focus, tasks, time at the pc", DIM));
             ui.horizontal(|ui| {
@@ -929,25 +2091,40 @@ impl Dash {
             });
             toggle(ui, &mut self.cfg.track_usage, "include time at the pc and top programs (stays on this computer, off by default)");
             if action(ui, "print receipt now", PINK).clicked() {
-                self.job("Printed your end-of-day receipt", |s| s.print_end_of_day());
+                self.run_cmd(Cmd::EndOfDay);
             }
         });
     }
 
-    fn add_reminder(&mut self, text: String, minutes: u32) {
-        let due = (Local::now() + chrono::Duration::minutes(minutes as i64)).to_rfc3339();
-        self.change_data(|d| {
-            let id = d.new_id();
-            d.reminders.push(data::Reminder { id, text, due, fired: false });
+    fn sched_planner(&mut self, ui: &mut Ui) {
+        section(ui, "07", "week planner", |ui| {
+            ui.label(mono("monday to sunday with your events and room to write, plus your open to-dos", DIM));
+            ui.horizontal(|ui| {
+                if action(ui, "this week", AMBER).clicked() {
+                    self.job("Printed the week planner", |s| s.print_planner(0));
+                }
+                if action(ui, "next week", CYAN).clicked() {
+                    self.job("Printed next week's planner", |s| s.print_planner(1));
+                }
+            });
         });
-        self.say(format!("Reminder set for {minutes} minutes from now"));
     }
 
     // -------------------------------------------------------------- Tasks
 
     fn page_tasks(&mut self, ui: &mut Ui) {
-        page_title(ui, "~/tasks", "// to-dos and habits");
+        let mut tab = self.tab();
+        page_title(ui, &format!("~/tasks/{}", TASK_TABS[tab]), "// to-dos, habits and countdowns");
+        tab_bar(ui, &mut tab, &TASK_TABS);
+        self.tabs[Page::Tasks.idx()] = tab;
+        match tab {
+            0 => self.tasks_todo(ui),
+            1 => self.tasks_habits(ui),
+            _ => self.tasks_countdowns(ui),
+        }
+    }
 
+    fn tasks_todo(&mut self, ui: &mut Ui) {
         section(ui, "01", "to-do", |ui| {
             ui.horizontal(|ui| {
                 let resp = text_field(ui, &mut self.new_todo, "add a task and press enter", 380.0);
@@ -959,6 +2136,7 @@ impl Dash {
                         d.todos.push(data::Todo { id, text, done: false });
                     });
                     self.new_todo.clear();
+                    resp.request_focus();
                 }
             });
             let todos = self.data.todos.clone();
@@ -986,15 +2164,16 @@ impl Dash {
             }
             ui.horizontal(|ui| {
                 if action(ui, "print list", AMBER).clicked() {
-                    let todos = self.data.todos.clone();
-                    self.job("Printed your to-do list", move |s| s.print(escpos::todo_list(&s.cfg(), &todos)));
+                    self.run_cmd(Cmd::Todos);
                 }
                 if ghost(ui, "clear finished").clicked() {
                     self.change_data(|d| d.todos.retain(|t| !t.done));
                 }
             });
         });
+    }
 
+    fn tasks_habits(&mut self, ui: &mut Ui) {
         section(ui, "02", "habits", |ui| {
             let today = Local::now().date_naive();
             let key = today.format("%Y-%m-%d").to_string();
@@ -1035,8 +2214,8 @@ impl Dash {
                     if ghost(ui, "print card").clicked() {
                         let hh = h.clone();
                         self.job("Printed the habit card", move |s| {
-                            let streak = data::streak(&hh, Local::now().date_naive());
-                            s.print(escpos::habit_card(&s.cfg(), &hh, Local::now().date_naive(), streak))
+                            let today = Local::now().date_naive();
+                            s.print(escpos::habit_card(&s.cfg(), &hh, today, data::streak(&hh, today)))
                         });
                     }
                     if ghost(ui, "x").clicked() {
@@ -1048,99 +2227,174 @@ impl Dash {
         });
     }
 
+    fn tasks_countdowns(&mut self, ui: &mut Ui) {
+        section(ui, "03", "countdowns", |ui| {
+            ui.label(mono("days left until a trip, a birthday, a deadline. they show up in your morning briefing.", DIM));
+            ui.horizontal_wrapped(|ui| {
+                text_field(ui, &mut self.cd_name, "Trip to Cairo", 220.0);
+                ui.add(egui::DragValue::new(&mut self.cd_date[0]).range(2024..=2100));
+                ui.label("-");
+                ui.add(egui::DragValue::new(&mut self.cd_date[1]).range(1..=12));
+                ui.label("-");
+                ui.add(egui::DragValue::new(&mut self.cd_date[2]).range(1..=31));
+                if action(ui, "add", AMBER).clicked() && !self.cd_name.trim().is_empty() {
+                    if let Some(date) = chrono::NaiveDate::from_ymd_opt(self.cd_date[0], self.cd_date[1] as u32, self.cd_date[2] as u32) {
+                        let name = self.cd_name.trim().to_string();
+                        let date = date.format("%Y-%m-%d").to_string();
+                        self.change_data(|d| {
+                            let id = d.new_id();
+                            d.countdowns.push(data::Countdown { id, name, date });
+                        });
+                        self.cd_name.clear();
+                    } else {
+                        self.say("That date doesn't exist.");
+                    }
+                }
+            });
+            let list = self.data.countdowns.clone();
+            let today = Local::now().date_naive();
+            for c in list {
+                let days = chrono::NaiveDate::parse_from_str(&c.date, "%Y-%m-%d").map(|d| (d - today).num_days()).unwrap_or(0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(&c.name).strong());
+                    ui.label(mono(&c.date, DIM));
+                    let text = match days {
+                        0 => "TODAY".to_string(),
+                        d if d < 0 => format!("{} d ago", -d),
+                        d => format!("{d} days"),
+                    };
+                    ui.label(RichText::new(text).strong().color(if days >= 0 { AMBER } else { DIM }));
+                    if ghost(ui, "x").clicked() {
+                        let id = c.id;
+                        self.change_data(|d| d.countdowns.retain(|x| x.id != id));
+                    }
+                });
+            }
+            if action(ui, "print countdowns", PINK).clicked() {
+                self.run_cmd(Cmd::Countdowns);
+            }
+        });
+    }
+
     // ------------------------------------------------------------- Alerts
 
     fn page_alerts(&mut self, ui: &mut Ui) {
-        page_title(ui, "~/alerts", "// pip taps you on the shoulder, on paper");
-
-        section(ui, "01", "downloads", |ui| {
-            toggle(ui, &mut self.cfg.alert_downloads, "print a slip when a download finishes");
-            ui.horizontal(|ui| {
-                ui.label("folder");
-                text_field(ui, &mut self.cfg.download_dir, "empty = your Downloads folder", 380.0);
-            });
-        });
-
-        section(ui, "02", "battery and disk", |ui| {
-            ui.horizontal(|ui| {
-                toggle(ui, &mut self.cfg.alert_battery, "battery drops to");
-                ui.add(egui::DragValue::new(&mut self.cfg.battery_pct).range(5..=90).suffix("%"));
-            });
-            ui.horizontal(|ui| {
-                toggle(ui, &mut self.cfg.alert_disk, "drive C: has less than");
-                ui.add(egui::DragValue::new(&mut self.cfg.disk_free_pct).range(1..=50).suffix("% free"));
-            });
-        });
-
-        section(ui, "03", "programs that finish", |ui| {
-            ui.label(mono("name a program (cargo, ffmpeg, blender). pip prints when it stops running.", DIM));
-            ui.horizontal(|ui| {
-                let resp = text_field(ui, &mut self.new_proc, "program name", 220.0);
-                let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                if (action(ui, "watch", AMBER).clicked() || enter) && !self.new_proc.trim().is_empty() {
-                    self.cfg.watch_procs.push(self.new_proc.trim().to_string());
-                    self.new_proc.clear();
-                }
-            });
-            let mut remove = None;
-            for (i, p) in self.cfg.watch_procs.iter().enumerate() {
+        let mut tab = self.tab();
+        page_title(ui, &format!("~/alerts/{}", ALERT_TABS[tab].replace(' ', "-")), "// pip taps you on the shoulder, on paper");
+        tab_bar(ui, &mut tab, &ALERT_TABS);
+        self.tabs[Page::Alerts.idx()] = tab;
+        match tab {
+            0 => section(ui, "01", "downloads", |ui| {
+                toggle(ui, &mut self.cfg.alert_downloads, "print a slip when a download finishes");
                 ui.horizontal(|ui| {
-                    ui.label(mono(p, CYAN));
-                    if ghost(ui, "x").clicked() {
-                        remove = Some(i);
+                    ui.label("folder");
+                    text_field(ui, &mut self.cfg.download_dir, "empty = your Downloads folder", 380.0);
+                });
+            }),
+            1 => section(ui, "02", "battery and disk", |ui| {
+                ui.horizontal(|ui| {
+                    toggle(ui, &mut self.cfg.alert_battery, "battery drops to");
+                    ui.add(egui::DragValue::new(&mut self.cfg.battery_pct).range(5..=90).suffix("%"));
+                });
+                ui.horizontal(|ui| {
+                    toggle(ui, &mut self.cfg.alert_disk, "drive C: has less than");
+                    ui.add(egui::DragValue::new(&mut self.cfg.disk_free_pct).range(1..=50).suffix("% free"));
+                });
+            }),
+            2 => section(ui, "03", "programs that finish", |ui| {
+                ui.label(mono("name a program (cargo, ffmpeg, blender). pip prints when it stops running.", DIM));
+                ui.horizontal(|ui| {
+                    let resp = text_field(ui, &mut self.new_proc, "program name", 220.0);
+                    let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    if (action(ui, "watch", AMBER).clicked() || enter) && !self.new_proc.trim().is_empty() {
+                        self.cfg.watch_procs.push(self.new_proc.trim().to_string());
+                        self.new_proc.clear();
                     }
                 });
-            }
-            if let Some(i) = remove {
-                self.cfg.watch_procs.remove(i);
-            }
-        });
-
-        section(ui, "04", "pages that change", |ui| {
-            ui.label(mono("pip checks every 10 minutes and prints when the page is different", DIM));
-            ui.horizontal(|ui| {
-                let resp = text_field(ui, &mut self.new_url, "https://...", 380.0);
-                let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                if (action(ui, "watch", AMBER).clicked() || enter) && self.new_url.trim().starts_with("http") {
-                    self.cfg.watch_urls.push(self.new_url.trim().to_string());
-                    self.new_url.clear();
+                let mut remove = None;
+                for (i, p) in self.cfg.watch_procs.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        ui.label(mono(p, CYAN));
+                        if ghost(ui, "x").clicked() {
+                            remove = Some(i);
+                        }
+                    });
                 }
-            });
-            let mut remove = None;
-            for (i, u) in self.cfg.watch_urls.iter().enumerate() {
+                if let Some(i) = remove {
+                    self.cfg.watch_procs.remove(i);
+                }
+            }),
+            3 => section(ui, "04", "pages that change", |ui| {
+                ui.label(mono("pip checks every 10 minutes and prints when the page is different", DIM));
                 ui.horizontal(|ui| {
-                    ui.label(mono(u, CYAN));
-                    if ghost(ui, "x").clicked() {
-                        remove = Some(i);
+                    let resp = text_field(ui, &mut self.new_url, "https://...", 380.0);
+                    let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    if (action(ui, "watch", AMBER).clicked() || enter) && self.new_url.trim().starts_with("http") {
+                        self.cfg.watch_urls.push(self.new_url.trim().to_string());
+                        self.new_url.clear();
                     }
                 });
-            }
-            if let Some(i) = remove {
-                self.cfg.watch_urls.remove(i);
-            }
-        });
-
-        section(ui, "05", "mail slips", |ui| {
-            ui.label(mono("prints sender and subject for new mail with a label you choose. read-only.", DIM));
-            ui.horizontal(|ui| {
-                toggle(ui, &mut self.cfg.mail, "print new mail labelled");
-                text_field(ui, &mut self.cfg.mail_label, "IMPORTANT", 140.0);
-            });
-            ui.label(mono("labels: IMPORTANT, STARRED, INBOX or a label id", DIM));
-            if self.cfg.mail && !self.cfg.google_has_mail {
-                ui.colored_label(AMBER, "Gmail access isn't granted yet: in settings tick \"also allow Gmail\" and connect Google again.");
-                if ghost(ui, "go to settings").clicked() {
-                    self.page = Page::Settings;
+                let mut remove = None;
+                for (i, u) in self.cfg.watch_urls.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        ui.label(mono(u, CYAN));
+                        if ghost(ui, "x").clicked() {
+                            remove = Some(i);
+                        }
+                    });
                 }
-            }
-        });
+                if let Some(i) = remove {
+                    self.cfg.watch_urls.remove(i);
+                }
+            }),
+            _ => section(ui, "05", "mail slips", |ui| {
+                ui.label(mono("prints sender and subject for new mail with a label you choose. read-only.", DIM));
+                ui.horizontal(|ui| {
+                    toggle(ui, &mut self.cfg.mail, "print new mail labelled");
+                    text_field(ui, &mut self.cfg.mail_label, "IMPORTANT", 140.0);
+                });
+                ui.label(mono("labels: IMPORTANT, STARRED, INBOX or a label id", DIM));
+                if self.cfg.mail && !self.cfg.google_has_mail {
+                    ui.colored_label(AMBER, "Gmail access isn't granted yet. Use the google sign-in tab and tick \"also allow reading Gmail\".");
+                    if action(ui, "open google sign-in", AMBER).clicked() {
+                        self.connect_open = true;
+                        self.connect_tab = 1;
+                    }
+                }
+            }),
+        }
     }
 
     // ----------------------------------------------------------- Settings
 
     fn page_settings(&mut self, ui: &mut Ui) {
-        page_title(ui, "~/settings", "// printer, pip and google");
+        let mut tab = self.tab();
+        page_title(ui, &format!("~/settings/{}", SET_TABS[tab]), "// printer, pip and calendar");
+        tab_bar(ui, &mut tab, &SET_TABS);
+        self.tabs[Page::Settings.idx()] = tab;
+        match tab {
+            0 => self.set_printer(ui),
+            1 => section(ui, "02", "system", |ui| {
+                toggle(ui, &mut self.cfg.start_with_windows, "start Thermo Companion with Windows");
+                toggle(ui, &mut self.cfg.hotkey, "Ctrl+Alt+P prints the selected text from any app");
+                toggle(ui, &mut self.cfg.setup_dismissed, "hide the getting-started list on Home");
+            }),
+            2 => self.set_calendar(ui),
+            _ => section(ui, "04", "about", |ui| {
+                ui.horizontal(|ui| {
+                    ui.add(egui::Image::from_texture(self.tex.get(Mood::Happy)).fit_to_exact_size(egui::vec2(72.0, 72.0)));
+                    ui.vertical(|ui| {
+                        ui.label(RichText::new(format!("Thermo Companion v{}", env!("CARGO_PKG_VERSION"))).strong());
+                        ui.label(mono("pip says hi. made with rust. mit license.", DIM));
+                        ui.label(mono(&format!("settings: {}", config::dir().display()), DIM));
+                        ui.label(mono("shortcuts: ctrl+k search, ctrl+1..7 pages, ctrl+alt+p print selection", DIM));
+                    });
+                });
+            }),
+        }
+    }
 
+    fn set_printer(&mut self, ui: &mut Ui) {
         section(ui, "01", "printer", |ui| {
             let printers = self.printers.clone();
             ui.horizontal(|ui| {
@@ -1166,7 +2420,7 @@ impl Dash {
             ui.horizontal(|ui| {
                 ui.label("Greek code page number");
                 let mut cp = self.cfg.codepage.map(|n| n.to_string()).unwrap_or_default();
-                if text_field(ui, &mut cp, "blank", 50.0).changed() {
+                if text_field(ui, &mut cp, "blank", 60.0).changed() {
                     self.cfg.codepage = cp.trim().parse::<u8>().ok();
                 }
                 ui.label(mono("advanced", DIM));
@@ -1177,67 +2431,37 @@ impl Dash {
                 self.job("Test slip printed", move |_| printer::print_raw(&cfg.printer, &escpos::test_slip(&cfg)));
             }
         });
+    }
 
-        section(ui, "02", "system", |ui| {
-            toggle(ui, &mut self.cfg.start_with_windows, "start Thermo Companion with Windows");
-            toggle(ui, &mut self.cfg.hotkey, "Ctrl+Alt+P prints the selected text from any app");
-        });
-
-        section(ui, "03", "google", |ui| {
-            let linked = self.sh.connected();
-            ui.horizontal(|ui| {
-                pill(ui, if linked { "connected" } else { "not connected" }, if linked { GREEN } else { DIM });
-                if linked && self.cfg.google_has_mail {
+    fn set_calendar(&mut self, ui: &mut Ui) {
+        section(ui, "03", "calendar and google", |ui| {
+            ui.horizontal_wrapped(|ui| {
+                pill(
+                    ui,
+                    if !self.cfg.ical_url.is_empty() {
+                        "calendar link active"
+                    } else if !self.cfg.google_refresh_token.is_empty() {
+                        "google sign-in active"
+                    } else {
+                        "no calendar yet"
+                    },
+                    if self.cfg.calendar_linked() { GREEN } else { DIM },
+                );
+                if self.cfg.google_has_mail {
                     pill(ui, "gmail ok", CYAN);
                 }
             });
-            ui.label(mono("create your own free OAuth client once (steps are in the README)", DIM));
+            ui.label("The easy way is a private calendar link. Google sign-in is only needed for mail slips.");
             ui.horizontal(|ui| {
-                ui.label("client id    ");
-                text_field(ui, &mut self.cfg.google_client_id, "xxxx.apps.googleusercontent.com", 380.0);
-            });
-            ui.horizontal(|ui| {
-                ui.label("client secret");
-                ui.add(egui::TextEdit::singleline(&mut self.cfg.google_client_secret).password(true).desired_width(380.0));
-            });
-            toggle(ui, &mut self.connect_mail, "also allow reading Gmail (for mail slips)");
-            ui.horizontal(|ui| {
-                let can = !self.cfg.google_client_id.trim().is_empty() && !self.cfg.google_client_secret.trim().is_empty() && !self.google_busy;
-                if ui.add_enabled(can, egui::Button::new(mono(if self.google_busy { "waiting for browser..." } else { "connect google" }, INK)).fill(AMBER)).clicked() {
-                    self.connect_google(ui.ctx().clone());
+                if action(ui, "connect calendar", AMBER).clicked() {
+                    self.connect_open = true;
+                    self.connect_tab = 0;
                 }
-                if linked && ghost(ui, "disconnect").clicked() {
-                    self.cfg.google_refresh_token.clear();
-                    self.cfg.google_has_mail = false;
-                    self.sh.events.lock().unwrap().clear();
-                    *self.sh.last_fetch.lock().unwrap() = None;
+                if ghost(ui, "google sign-in (mail)").clicked() {
+                    self.connect_open = true;
+                    self.connect_tab = 1;
                 }
             });
-        });
-
-        section(ui, "04", "about", |ui| {
-            ui.horizontal(|ui| {
-                ui.add(egui::Image::from_texture(self.tex.get(Mood::Happy)).fit_to_exact_size(egui::vec2(72.0, 72.0)));
-                ui.vertical(|ui| {
-                    ui.label(RichText::new(format!("Thermo Companion v{}", env!("CARGO_PKG_VERSION"))).strong());
-                    ui.label(mono("pip says hi. made with rust. mit license.", DIM));
-                    ui.label(mono(&format!("settings: {}", config::dir().display()), DIM));
-                });
-            });
-        });
-    }
-
-    fn connect_google(&mut self, ctx: egui::Context) {
-        let id = self.cfg.google_client_id.trim().to_string();
-        let secret = self.cfg.google_client_secret.trim().to_string();
-        let with_mail = self.connect_mail;
-        let slot = self.google.clone();
-        self.google_busy = true;
-        self.say("Opening your browser for Google sign-in...");
-        std::thread::spawn(move || {
-            let r = gcal::connect(&id, &secret, with_mail);
-            *slot.lock().unwrap() = Some(r);
-            ctx.request_repaint();
         });
     }
 }
@@ -1266,6 +2490,7 @@ impl eframe::App for Dash {
                 egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                     match self.page {
                         Page::Home => self.page_home(ui),
+                        Page::Notes => self.page_notes(ui),
                         Page::Print => self.page_print(ui),
                         Page::Schedule => self.page_schedule(ui),
                         Page::Tasks => self.page_tasks(ui),
@@ -1275,6 +2500,10 @@ impl eframe::App for Dash {
                     ui.add_space(24.0);
                 });
             });
+
+        // popups on top
+        self.connect_window(&ctx);
+        self.palette(&ctx);
 
         // settings edited on screen: save them, and apply "start with Windows" right away
         if self.cfg != before {
@@ -1299,8 +2528,8 @@ pub fn run(page: Option<String>) {
     let (w, h) = (icon.width(), icon.height());
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1060.0, 720.0])
-            .with_min_inner_size([880.0, 560.0])
+            .with_inner_size([1100.0, 740.0])
+            .with_min_inner_size([900.0, 560.0])
             .with_title(WINDOW_TITLE)
             .with_drag_and_drop(true)
             .with_icon(egui::IconData { rgba: icon.into_raw(), width: w, height: h }),

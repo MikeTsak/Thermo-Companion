@@ -7,6 +7,7 @@ mod dashboard;
 mod data;
 mod escpos;
 mod gcal;
+mod ical;
 mod net;
 mod pip;
 mod printer;
@@ -61,6 +62,8 @@ struct Tray {
     mi_briefing: nwg::MenuItem,
     mi_eod: nwg::MenuItem,
     mi_clip: nwg::MenuItem,
+    mi_note: nwg::MenuItem,
+    mi_fortune: nwg::MenuItem,
     mi_focus: nwg::MenuItem,
     mi_test: nwg::MenuItem,
     t_agenda: nwg::MenuItem,
@@ -111,6 +114,8 @@ fn build(shared: Arc<Shared>) -> Result<Tray, nwg::NwgError> {
     let mi_briefing = item("Print morning briefing")?;
     let mi_eod = item("Print end-of-day receipt")?;
     let mi_clip = item("Print clipboard")?;
+    let mi_note = item("New note...")?;
+    let mi_fortune = item("Pip's fortune cookie")?;
     let mi_focus = item("Start / stop focus timer")?;
     let mi_test = item("Print test slip")?;
     let sep2 = sep()?;
@@ -133,6 +138,8 @@ fn build(shared: Arc<Shared>) -> Result<Tray, nwg::NwgError> {
         mi_briefing,
         mi_eod,
         mi_clip,
+        mi_note,
+        mi_fortune,
         mi_focus,
         mi_test,
         t_agenda,
@@ -257,6 +264,12 @@ fn on_event(t: &Rc<Tray>, evt: E, handle: nwg::ControlHandle) {
                         .ok_or("the clipboard has no text")?;
                     let o = escpos::TextOpts { bold: false, big: false, center: false, stamp: true, checklist: false };
                     s.print(escpos::text_slip(&s.cfg(), &text, &o))
+                });
+            } else if handle == t.mi_note.handle {
+                open_dashboard(Some("notes-new"));
+            } else if handle == t.mi_fortune.handle {
+                app::spawn_job(sh, t.notify_fn(), "Printed a fortune", |s| {
+                    s.print(escpos::fortune_slip(&s.cfg(), "FORTUNE", pip::fortune(), true))
                 });
             } else if handle == t.mi_focus.handle {
                 t.toggle_focus();
