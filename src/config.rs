@@ -261,9 +261,20 @@ pub fn load() -> (Config, bool) {
 
 pub fn save(cfg: &Config) {
     if let Ok(text) = serde_json::to_string_pretty(cfg) {
+        let target = path();
         let tmp = dir().join("config.json.tmp");
-        if fs::write(&tmp, text).is_ok() {
-            let _ = fs::rename(&tmp, path());
+        if let Err(e) = fs::write(&tmp, &text) {
+            log(&format!("config save tmp failed: {e}"));
+            return;
+        }
+        if fs::rename(&tmp, &target).is_err() {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            if fs::rename(&tmp, &target).is_err() {
+                if let Err(e) = fs::write(&target, &text) {
+                    log(&format!("config save failed: {e}"));
+                }
+                let _ = fs::remove_file(&tmp);
+            }
         }
     }
 }

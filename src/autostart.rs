@@ -5,6 +5,7 @@ use winreg::RegKey;
 
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const VALUE_NAME: &str = "ThermoCompanion";
+const CONTEXT_KEY: &str = r"Software\Classes\*\shell\ThermoPrint";
 
 pub fn is_enabled() -> bool {
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
@@ -25,6 +26,37 @@ pub fn set(enabled: bool) -> Result<(), String> {
     } else {
         // Deleting a value that isn't there is fine.
         let _ = key.delete_value(VALUE_NAME);
+        Ok(())
+    }
+}
+
+pub fn context_menu_enabled() -> bool {
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    hkcu.open_subkey_with_flags(CONTEXT_KEY, KEY_READ).is_ok()
+}
+
+/// Add or remove the "Thermo Print" entry in Windows Explorer's file right-click menu (per-user, no admin needed).
+pub fn set_context_menu(enabled: bool) -> Result<(), String> {
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    if enabled {
+        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+        let icon = exe
+            .parent()
+            .map(|d| d.join("icon.ico"))
+            .filter(|p| p.exists())
+            .map(|p| format!("\"{}\"", p.display()))
+            .unwrap_or_else(|| format!("\"{}\",0", exe.display()));
+
+        let (shell_key, _) = hkcu.create_subkey(CONTEXT_KEY).map_err(|e| e.to_string())?;
+        shell_key.set_value("", &"Thermo Print").map_err(|e| e.to_string())?;
+        shell_key.set_value("Icon", &icon).map_err(|e| e.to_string())?;
+
+        let (cmd_key, _) = shell_key.create_subkey("command").map_err(|e| e.to_string())?;
+        cmd_key
+            .set_value("", &format!("\"{}\" --print-file \"%1\"", exe.display()))
+            .map_err(|e| e.to_string())
+    } else {
+        let _ = hkcu.delete_subkey_all(CONTEXT_KEY);
         Ok(())
     }
 }

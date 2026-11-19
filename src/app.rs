@@ -88,6 +88,14 @@ impl Shared {
         printer::print_raw(&self.cfg().printer, &data)
     }
 
+    pub fn mark_tested(&self) {
+        let mut c = self.cfg();
+        if !c.did_test {
+            c.did_test = true;
+            self.set_cfg(c);
+        }
+    }
+
     pub fn refresh_events(&self) -> Result<(), String> {
         let cfg = self.cfg();
         let events = if !cfg.ical_url.trim().is_empty() {
@@ -254,6 +262,46 @@ where
         });
         notify();
     });
+}
+
+/// Build an ESC/POS slip for a right-clicked file (image or UTF-8/plain text).
+pub fn build_file_slip(cfg: &Config, path: &std::path::Path) -> Result<Vec<u8>, String> {
+    let ext = path
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    if ["png", "jpg", "jpeg", "bmp", "gif", "webp"].contains(&ext.as_str()) {
+        let dots = (cfg.paper_chars.max(16) as u32) * 12;
+        let bm = crate::raster::from_file(&path.to_string_lossy(), dots, 0.0, true)?;
+        let caption = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        return Ok(escpos::image_slip(cfg, &bm, &caption));
+    }
+
+    let meta = std::fs::metadata(path).map_err(|e| format!("can't open {}: {e}", path.display()))?;
+    if !meta.is_file() {
+        return Err("Only files can be printed with Thermo Print.".into());
+    }
+    if meta.len() > 256 * 1024 {
+        return Err("File is too large for receipt paper (max 256 KB).".into());
+    }
+    let bytes = std::fs::read(path).map_err(|e| format!("can't read {}: {e}", path.display()))?;
+    if bytes.contains(&0) {
+        return Err("That looks like a binary file. Choose a text file or an image (png/jpg/gif/webp/bmp).".into());
+    }
+    let text = String::from_utf8_lossy(&bytes);
+    if text.trim().is_empty() {
+        return Err("That file is empty.".into());
+    }
+    let opts = TextOpts { bold: false, big: false, center: false, stamp: true, checklist: false };
+    Ok(escpos::text_slip(cfg, &text, &opts))
+}
+
+pub fn print_file(cfg: &Config, path: &std::path::Path) -> Result<(), String> {
+    let slip = build_file_slip(cfg, path)?;
+    printer::print_raw(&cfg.printer, &slip)
 }
 
 /// Global hotkey: copy what is selected (or fall back to the clipboard) and print it.
@@ -691,4 +739,26 @@ fn check_mail(sh: &Arc<Shared>, notify: &Notify, cfg: &Config) -> Result<(), Str
     sh.print(escpos::mail_slip(cfg, &batch))?;
     say(sh, notify, format!("Printed {} new mail", batch.len()));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builds_text_and_rejects_binary_file_slips() {
+        let cfg = Config::default();
+        let dir = std::env::temp_dir();
+        let txt_path = dir.join("thermo_test_print_file.txt");
+        let bin_path = dir.join("thermo_test_print_file.bin");
+
+        std::fs::write(&txt_path, "hello from right-click!").unwrap();
+        let slip = build_file_slip(&cfg, &txt_path).unwrap();
+        assert!(slip.len() > 20);
+        let _ = std::fs::remove_file(&txt_path);
+
+        std::fs::write(&bin_path, b"\x00\x01\x02\x03").unwrap();
+        assert!(build_file_slip(&cfg, &bin_path).is_err());
+        let _ = std::fs::remove_file(&bin_path);
+    }
 }

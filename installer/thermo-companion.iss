@@ -37,6 +37,7 @@ LicenseFile=..\LICENSE
 [Tasks]
 Name: "startup"; Description: "Start Thermo Companion when Windows starts"; GroupDescription: "Options:"; Flags: unchecked
 Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Options:"; Flags: unchecked
+Name: "contextmenu"; Description: "Add ""Thermo Print"" to file right-click menu"; GroupDescription: "Options:"
 
 [Files]
 Source: "..\target\release\{#AppExe}"; DestDir: "{app}"; Flags: ignoreversion
@@ -50,6 +51,9 @@ Name: "{autodesktop}\Thermo Companion"; Filename: "{app}\{#AppExe}"; IconFilenam
 
 [Registry]
 Root: HKA; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "ThermoCompanion"; ValueData: """{app}\{#AppExe}"""; Flags: uninsdeletevalue; Tasks: startup
+Root: HKA; Subkey: "Software\Classes\*\shell\ThermoPrint"; ValueType: string; ValueData: "Thermo Print"; Flags: uninsdeletekey; Tasks: contextmenu
+Root: HKA; Subkey: "Software\Classes\*\shell\ThermoPrint"; ValueType: string; ValueName: "Icon"; ValueData: """{app}\icon.ico"""; Tasks: contextmenu
+Root: HKA; Subkey: "Software\Classes\*\shell\ThermoPrint\command"; ValueType: string; ValueData: """{app}\{#AppExe}"" --print-file ""%1"""; Tasks: contextmenu
 
 [Run]
 Filename: "{app}\{#AppExe}"; Parameters: "--autostart"; Description: "Start Pip now"; Flags: nowait postinstall skipifsilent; Tasks: startup

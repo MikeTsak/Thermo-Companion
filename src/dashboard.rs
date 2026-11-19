@@ -497,6 +497,7 @@ struct Dash {
     // hotkey recorder
     hotkey_listen: bool,
     hotkey_note: String,
+    context_menu: bool,
 }
 
 const STICKERS: [(&str, Mood); 5] = [
@@ -635,6 +636,7 @@ impl Dash {
             upd_apply_slot: Arc::new(Mutex::new(None)),
             hotkey_listen: false,
             hotkey_note: String::new(),
+            context_menu: autostart::context_menu_enabled(),
         }
     }
 
@@ -702,10 +704,6 @@ impl Dash {
     }
 
     fn tick(&mut self, ctx: &egui::Context) {
-        // settings changed by the tray (toggles) or the scheduler
-        if self.sh.reload_if_changed() {
-            self.cfg = self.sh.cfg();
-        }
         if self.data_at.elapsed() > Duration::from_millis(700) {
             self.refresh_data();
         }
@@ -899,7 +897,11 @@ impl Dash {
                 let todos = self.data.todos.clone();
                 self.job("Printed your to-do list", move |s| s.print(escpos::todo_list(&s.cfg(), &todos)));
             }
-            Cmd::TestSlip => self.job("Test slip printed", |s| s.print(escpos::test_slip(&s.cfg()))),
+            Cmd::TestSlip => self.job("Test slip printed", |s| {
+                s.print(escpos::test_slip(&s.cfg()))?;
+                s.mark_tested();
+                Ok(())
+            }),
             Cmd::ToggleFocus => self.toggle_focus(),
             Cmd::NewNote => {
                 self.goto(Page::Notes, 0);
@@ -2553,6 +2555,29 @@ impl Dash {
                 });
                 ui.label(mono("optional: runs Pip quietly in your tray when you sign in to Windows", DIM));
                 ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    let prev = self.context_menu;
+                    toggle(ui, &mut self.context_menu, "add \"Thermo Print\" to file right-click menu");
+                    pill(
+                        ui,
+                        if self.context_menu { "enabled" } else { "off" },
+                        if self.context_menu { GREEN } else { DIM },
+                    );
+                    if self.context_menu != prev {
+                        if let Err(e) = autostart::set_context_menu(self.context_menu) {
+                            self.context_menu = prev;
+                            self.say(format!("Couldn't update right-click menu: {e}"));
+                        } else {
+                            self.say(if self.context_menu {
+                                "Added \"Thermo Print\" to Windows file right-click menu."
+                            } else {
+                                "Removed \"Thermo Print\" from right-click menu."
+                            });
+                        }
+                    }
+                });
+                ui.label(mono("right-click any image or text file in Explorer (Show more options on Win 11) -> Thermo Print", DIM));
+                ui.add_space(4.0);
                 let hk_label = self.cfg.hotkey_label();
                 toggle(ui, &mut self.cfg.hotkey, &format!("{hk_label} prints the selected text from any app"));
                 ui.horizontal_wrapped(|ui| {
@@ -2652,7 +2677,11 @@ impl Dash {
             toggle(ui, &mut self.cfg.pip_stickers, "add a tiny Pip sticker to the bottom of every slip");
             if action(ui, "test print", AMBER).clicked() {
                 let cfg = self.cfg.clone();
-                self.job("Test slip printed", move |_| printer::print_raw(&cfg.printer, &escpos::test_slip(&cfg)));
+                self.job("Test slip printed", move |s| {
+                    printer::print_raw(&cfg.printer, &escpos::test_slip(&cfg))?;
+                    s.mark_tested();
+                    Ok(())
+                });
             }
         });
     }
@@ -2797,8 +2826,12 @@ impl Dash {
 impl eframe::App for Dash {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        let mut before = self.cfg.clone();
+        if self.sh.reload_if_changed() {
+            self.cfg = self.sh.cfg();
+            before = self.cfg.clone();
+        }
         self.tick(&ctx);
-        let before = self.cfg.clone();
 
         egui::Panel::left("nav")
             .exact_size(210.0)

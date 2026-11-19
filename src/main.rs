@@ -286,7 +286,11 @@ fn on_event(t: &Rc<Tray>, evt: E, handle: nwg::ControlHandle) {
             } else if handle == t.mi_focus.handle {
                 t.toggle_focus();
             } else if handle == t.mi_test.handle {
-                app::spawn_job(sh, t.notify_fn(), "Test slip printed", |s| s.print(escpos::test_slip(&s.cfg())));
+                app::spawn_job(sh, t.notify_fn(), "Test slip printed", |s| {
+                    s.print(escpos::test_slip(&s.cfg()))?;
+                    s.mark_tested();
+                    Ok(())
+                });
             } else if handle == t.t_agenda.handle {
                 t.toggle(|c| c.auto_agenda = !c.auto_agenda);
             } else if handle == t.t_briefing.handle {
@@ -363,13 +367,45 @@ fn run_tray() {
     nwg::dispatch_thread_events();
 }
 
+fn show_error_box(msg: &str) {
+    use winapi::um::winuser::{MessageBoxW, MB_ICONERROR, MB_OK};
+    let text: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
+    let title: Vec<u16> = "Thermo Print".encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        MessageBoxW(null_mut(), text.as_ptr(), title.as_ptr(), MB_OK | MB_ICONERROR);
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
+    // `thermo-companion.exe --print-file <path>`: print a right-clicked image or text file and exit.
+    if let Some(pos) = args.iter().position(|a| a == "--print-file") {
+        let Some(file_arg) = args.get(pos + 1) else {
+            std::process::exit(1);
+        };
+        let (cfg, _) = config::load();
+        let path = std::path::Path::new(file_arg);
+        let result = app::print_file(&cfg, path);
+        config::log(&match &result {
+            Ok(()) => format!("right-click printed \"{}\"", path.display()),
+            Err(e) => format!("right-click print failed for \"{}\": {e}", path.display()),
+        });
+        if let Err(e) = result {
+            show_error_box(&e);
+            std::process::exit(1);
+        }
+        return;
+    }
+
     // `thermo-companion.exe --test-print`: print one test slip and exit (result goes to log.txt).
     if args.iter().any(|a| a == "--test-print") {
-        let (cfg, _) = config::load();
+        let (mut cfg, _) = config::load();
         let result = printer::print_raw(&cfg.printer, &escpos::test_slip(&cfg));
+        if result.is_ok() && !cfg.did_test {
+            cfg.did_test = true;
+            config::save(&cfg);
+        }
         config::log(&match &result {
             Ok(()) => format!("test print sent to \"{}\"", cfg.printer),
             Err(e) => format!("test print failed: {e}"),
